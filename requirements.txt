@@ -4,8 +4,10 @@ httpx
 pydantic-settings
 typer
 pytest
+pytest-asyncio
 pre-commit
 fastapi
 uvicorn
 sqlalchemy
-psycopg2-binary
+asyncpg
+aiosqlite

@@ -8,3 +8,7 @@ select = ["E", "F", "I", "W"]
 [tool.mypy]
 python_version = "3.13"
 ignore_missing_imports = true
+plugins = ["sqlalchemy.ext.mypy.plugin"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

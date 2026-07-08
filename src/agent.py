@@ -30,11 +30,11 @@ class TaskMasterAgent:
         self.history: list[dict] = [{"role": "system", "text": SYSTEM_PROMPT}]
 
     @classmethod
-    def run_once(cls, user_input: str, user_id: int = 1, max_turns=5) -> str:
+    async def run_once(cls, user_input: str, user_id: int = 1, max_turns=5) -> str:
         agent = cls(user_id=user_id)
-        return agent.run(user_input, max_turns)
+        return await agent.run(user_input, max_turns)
 
-    def _call_api(self, messages: list[dict]) -> dict:
+    async def _call_api(self, messages: list[dict]) -> dict:
         payload = {
             "modelUri": MODEL_URI,
             "completionOptions": {
@@ -50,25 +50,25 @@ class TaskMasterAgent:
             "x-folder-id": settings.yandex_folder_id,
             "Content-Type": "application/json",
         }
-        with httpx.Client() as client:
-            resp = client.post(API_URL, headers=headers, json=payload, timeout=60)
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(API_URL, headers=headers, json=payload, timeout=60)
             resp.raise_for_status()
             return resp.json()
 
-    def _execute_tool(self, func_name: str, func_args: dict) -> str:
+    async def _execute_tool(self, func_name: str, func_args: dict) -> str:
         logger.info("Calling tool: %s %s", func_name, func_args)
         if func_name == "get_current_time":
             return get_current_time()
         elif func_name == "save_tasks_to_matrix":
-            return save_tasks_to_matrix(func_args["tasks"], user_id=self.user_id)
+            return await save_tasks_to_matrix(func_args["tasks"], user_id=self.user_id)
         return "Ошибка: инструмент не найден"
 
-    def run(self, user_input: str, max_turns=5) -> str:
+    async def run(self, user_input: str, max_turns=5) -> str:
         self.history.append({"role": "user", "text": user_input})
 
         for turn in range(max_turns):
             logger.info("API call turn %d/%d", turn + 1, max_turns)
-            data = self._call_api(self.history)
+            data = await self._call_api(self.history)
             alternative = data["result"]["alternatives"][0]
             message = alternative["message"]
             status = alternative["status"]
@@ -82,7 +82,7 @@ class TaskMasterAgent:
                 tool_results = []
                 for tc in tool_calls:
                     fc = tc["functionCall"]
-                    result = self._execute_tool(fc["name"], fc["arguments"])
+                    result = await self._execute_tool(fc["name"], fc["arguments"])
                     tool_results.append(
                         {
                             "functionResult": {

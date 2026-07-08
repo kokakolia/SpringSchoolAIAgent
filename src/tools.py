@@ -19,17 +19,17 @@ def get_current_time():
     return now.strftime("Сегодня: %Y-%m-%d, %A. Время: %H:%M")
 
 
-def save_tasks_to_matrix(tasks: list[dict], user_id: int = 1) -> str:
+async def save_tasks_to_matrix(tasks: list[dict], user_id: int = 1) -> str:
     logger.info("Saving %d tasks (user=%d)", len(tasks), user_id)
-    return database.save_tasks(tasks, user_id)
+    return await database.save_tasks(tasks, user_id)
 
 
-def read_matrix(user_id: int = 1) -> dict[int, list[dict]]:
-    return database.read_matrix(user_id)
+async def read_matrix(user_id: int = 1) -> dict[int, list[dict]]:
+    return await database.read_matrix(user_id)
 
 
-def display_matrix(user_id: int = 1):
-    by_quadrant = read_matrix(user_id)
+async def display_matrix(user_id: int = 1):
+    by_quadrant = await read_matrix(user_id)
     if not by_quadrant or all(len(v) == 0 for v in by_quadrant.values()):
         print("\nМатрица пуста. Добавьте задачи через агента.")
         return
@@ -69,17 +69,17 @@ def display_matrix(user_id: int = 1):
     print()
 
 
-def delete_task(row_id: int, user_id: int = 1) -> str:
-    return database.delete_task_db(row_id, user_id)
+async def delete_task(row_id: int, user_id: int = 1) -> str:
+    return await database.delete_task_db(row_id, user_id)
 
 
-def move_task(row_id: int, new_quadrant: int, user_id: int = 1) -> str:
-    return database.move_task_db(row_id, new_quadrant, user_id)
+async def move_task(row_id: int, new_quadrant: int, user_id: int = 1) -> str:
+    return await database.move_task_db(row_id, new_quadrant, user_id)
 
 
-def export_to_excel(filename: str | None = None, user_id: int = 1):
+async def export_to_excel(filename: str | None = None, user_id: int = 1):
     path = filename or settings.matrix_path
-    data = read_matrix(user_id)
+    data = await read_matrix(user_id)
     wb = Workbook()
     ws = wb.active
     ws.title = "Задачи"

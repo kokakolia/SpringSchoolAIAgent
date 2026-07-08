@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     matrix_path: str = "matrix.xlsx"
     server_host: str = "127.0.0.1"
     server_port: int = 8000
-    database_url: str = "postgresql://postgres:postgres@localhost:5432/taskmaster"
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/taskmaster"
 
 
 settings = Settings()

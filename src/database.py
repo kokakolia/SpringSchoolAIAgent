@@ -1,13 +1,21 @@
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, Column, DateTime, Integer, String, create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    DateTime,
+    Integer,
+    String,
+    select,
+)
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import declarative_base
 
 from src.config import settings
 
 Base = declarative_base()
-_engine = None
-_SessionLocal = None
+_async_engine = None
+_async_session_maker = None
 
 
 class Task(Base):
@@ -23,56 +31,54 @@ class Task(Base):
     __table_args__ = (CheckConstraint("quadrant BETWEEN 1 AND 4"),)
 
 
-def _get_engine():
-    global _engine
-    if _engine is None:
-        _engine = create_engine(settings.database_url)
-    return _engine
+def _get_session_maker() -> async_sessionmaker[AsyncSession]:
+    global _async_engine, _async_session_maker
+    if _async_session_maker is None:
+        _async_engine = create_async_engine(settings.database_url)
+        _async_session_maker = async_sessionmaker(_async_engine, expire_on_commit=False)
+    return _async_session_maker
 
 
-def _get_session():
-    global _SessionLocal
-    if _SessionLocal is None:
-        _SessionLocal = sessionmaker(bind=_get_engine())
-    return _SessionLocal()
+async def init_db():
+    global _async_engine
+    if _async_engine is None:
+        _async_engine = create_async_engine(settings.database_url)
+    async with _async_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
-def init_db():
-    Base.metadata.create_all(_get_engine())
+async def save_tasks(tasks: list[dict], user_id: int = 1) -> str:
+    maker = _get_session_maker()
+    async with maker() as session:
+        try:
+            now = datetime.now()
+            for task in tasks:
+                t = Task(
+                    user_id=user_id,
+                    title=task.get("title", "Без названия"),
+                    quadrant=task.get("quadrant", 0),
+                    reason=task.get("reason", ""),
+                    created_at=now,
+                )
+                session.add(t)
+            await session.commit()
+            return f"Успешно: {len(tasks)} задач сохранено."
+        except Exception as e:
+            await session.rollback()
+            return f"Ошибка: {str(e)}"
 
 
-def save_tasks(tasks: list[dict], user_id: int = 1) -> str:
-    session = _get_session()
-    try:
-        now = datetime.now()
-        for task in tasks:
-            t = Task(
-                user_id=user_id,
-                title=task.get("title", "Без названия"),
-                quadrant=task.get("quadrant", 0),
-                reason=task.get("reason", ""),
-                created_at=now,
-            )
-            session.add(t)
-        session.commit()
-        return f"Успешно: {len(tasks)} задач сохранено."
-    except Exception as e:
-        session.rollback()
-        return f"Ошибка: {str(e)}"
-    finally:
-        session.close()
-
-
-def read_matrix(user_id: int = 1) -> dict[int, list[dict]]:
-    session = _get_session()
-    try:
-        rows = session.query(Task).filter(Task.user_id == user_id).order_by(Task.id).all()
-    finally:
-        session.close()
+async def read_matrix(user_id: int = 1) -> dict[int, list[dict]]:
+    maker = _get_session_maker()
+    async with maker() as session:
+        result = await session.execute(
+            select(Task).where(Task.user_id == user_id).order_by(Task.id)
+        )
+        rows = result.scalars().all()
 
     by_quadrant: dict[int, list[dict]] = {1: [], 2: [], 3: [], 4: []}
     for r in rows:
-        by_quadrant.setdefault(r.quadrant, []).append(
+        by_quadrant.setdefault(r.quadrant or 0, []).append(
             {
                 "id": r.id,
                 "title": r.title,
@@ -84,35 +90,39 @@ def read_matrix(user_id: int = 1) -> dict[int, list[dict]]:
     return by_quadrant
 
 
-def delete_task_db(task_id: int, user_id: int = 1) -> str:
-    session = _get_session()
-    try:
-        task = session.query(Task).filter(Task.id == task_id, Task.user_id == user_id).first()
-        if not task:
-            return f"Задача #{task_id} не найдена."
-        session.delete(task)
-        session.commit()
-        return f"Задача #{task_id} удалена."
-    except Exception as e:
-        session.rollback()
-        return f"Ошибка: {str(e)}"
-    finally:
-        session.close()
+async def delete_task_db(task_id: int, user_id: int = 1) -> str:
+    maker = _get_session_maker()
+    async with maker() as session:
+        try:
+            result = await session.execute(
+                select(Task).where(Task.id == task_id, Task.user_id == user_id)
+            )
+            task = result.scalar_one_or_none()
+            if not task:
+                return f"Задача #{task_id} не найдена."
+            await session.delete(task)
+            await session.commit()
+            return f"Задача #{task_id} удалена."
+        except Exception as e:
+            await session.rollback()
+            return f"Ошибка: {str(e)}"
 
 
-def move_task_db(task_id: int, new_quadrant: int, user_id: int = 1) -> str:
+async def move_task_db(task_id: int, new_quadrant: int, user_id: int = 1) -> str:
     if new_quadrant not in range(1, 5):
         return "Квадрант должен быть 1-4."
-    session = _get_session()
-    try:
-        task = session.query(Task).filter(Task.id == task_id, Task.user_id == user_id).first()
-        if not task:
-            return f"Задача #{task_id} не найдена."
-        task.quadrant = new_quadrant
-        session.commit()
-        return f"Задача #{task_id} перемещена в квадрант {new_quadrant}."
-    except Exception as e:
-        session.rollback()
-        return f"Ошибка: {str(e)}"
-    finally:
-        session.close()
+    maker = _get_session_maker()
+    async with maker() as session:
+        try:
+            result = await session.execute(
+                select(Task).where(Task.id == task_id, Task.user_id == user_id)
+            )
+            task = result.scalar_one_or_none()
+            if not task:
+                return f"Задача #{task_id} не найдена."
+            task.quadrant = new_quadrant
+            await session.commit()
+            return f"Задача #{task_id} перемещена в квадрант {new_quadrant}."
+        except Exception as e:
+            await session.rollback()
+            return f"Ошибка: {str(e)}"
