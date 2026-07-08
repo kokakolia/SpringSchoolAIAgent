@@ -40,7 +40,7 @@ class TaskMasterAgent:
             "completionOptions": {
                 "stream": False,
                 "temperature": 0.3,
-                "maxTokens": "2000",
+                "maxTokens": 2000,
             },
             "messages": messages,
             "tools": TOOLS_DESCRIPTION,

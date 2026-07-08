@@ -1,4 +1,4 @@
-import datetime
+from datetime import datetime
 
 from openpyxl import Workbook
 
@@ -15,7 +15,7 @@ QUADRANT_LABELS = {
 
 
 def get_current_time():
-    now = datetime.datetime.now()
+    now = datetime.now()
     return now.strftime("Сегодня: %Y-%m-%d, %A. Время: %H:%M")
 
 

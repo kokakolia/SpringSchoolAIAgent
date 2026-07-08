@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -5,12 +7,14 @@ from src import database
 from src.agent import TaskMasterAgent
 from src.tools import export_to_excel
 
-app = FastAPI(title="AI Task Master API", version="1.0.0")
 
-
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     await database.init_db()
+    yield
+
+
+app = FastAPI(title="AI Task Master API", version="1.0.0", lifespan=lifespan)
 
 
 class ProcessRequest(BaseModel):

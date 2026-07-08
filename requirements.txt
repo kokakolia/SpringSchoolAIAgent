@@ -1,5 +1,4 @@
 openpyxl
-python-dotenv
 httpx
 pydantic-settings
 typer
