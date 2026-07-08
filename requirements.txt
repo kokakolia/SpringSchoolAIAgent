@@ -1,0 +1,11 @@
+openpyxl
+python-dotenv
+httpx
+pydantic-settings
+typer
+pytest
+pre-commit
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
