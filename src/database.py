@@ -2,18 +2,21 @@ from datetime import datetime
 
 from sqlalchemy import (
     CheckConstraint,
-    Column,
     DateTime,
     Integer,
     String,
     select,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from src.config import settings
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    pass
+
+
 _async_engine = None
 _async_session_maker = None
 
@@ -21,12 +24,12 @@ _async_session_maker = None
 class Task(Base):
     __tablename__ = "tasks"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, default=1)
-    title = Column(String(500), nullable=False)
-    quadrant = Column(Integer, nullable=False)
-    reason = Column(String(1000), default="")
-    created_at = Column(DateTime, default=datetime.now)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    quadrant: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(1000), default="")
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.now)
 
     __table_args__ = (CheckConstraint("quadrant BETWEEN 1 AND 4"),)
 
@@ -34,17 +37,21 @@ class Task(Base):
 def _get_session_maker() -> async_sessionmaker[AsyncSession]:
     global _async_engine, _async_session_maker
     if _async_session_maker is None:
-        _async_engine = create_async_engine(settings.database_url)
+        if _async_engine is None:
+            _async_engine = create_async_engine(settings.database_url)
         _async_session_maker = async_sessionmaker(_async_engine, expire_on_commit=False)
     return _async_session_maker
 
 
 async def init_db():
+    from src import memory_models  # noqa: F401
+    from src.migrations import upgrade
+
     global _async_engine
     if _async_engine is None:
         _async_engine = create_async_engine(settings.database_url)
     async with _async_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(upgrade)
 
 
 async def save_tasks(tasks: list[dict], user_id: int = 1) -> str:

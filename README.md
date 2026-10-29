@@ -1,117 +1,111 @@
-# AI Task Master
+# До дедлайна
 
-Интеллектуальный агент для планирования задач на основе матрицы Эйзенхауэра.
+AI-агент для проектов, которые нужно успеть закончить. Предлагает план, объясняет
+приоритеты и компромиссы, учитывает возражения и пересчитывает работу при изменении условий.
+В интерфейсе — **«мой план лучше»**.
 
-## Стек
+**Сценарий:** цель и ограничения → предложение → проверка времени и зависимостей →
+спор с агентом → сравнение вариантов → принятие → следующий шаг.
 
-- **LLM:** YandexGPT (Yandex Cloud)
-- **Бекенд:** Python + FastAPI (async)
-- **CLI:** Typer
-- **Хранилище:** PostgreSQL (SQLAlchemy async) + экспорт в Excel
-- **CI:** GitHub Actions (ruff, mypy, pytest)
+![Обсуждение плана](docs/screenshots/deadline.png)
 
-[![CI](https://github.com/kokakolia/SpringSchoolAIAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/kokakolia/SpringSchoolAIAgent/actions/workflows/ci.yml)
+- Планы с причинами, зависимостями, оценками времени и критериями готовности.
+- Закрепление задач, учёт фактического времени и изменения условий проекта.
+- Переименование проектов и удаление с подтверждением, включая связанные данные.
+- Серверная проверка выполнимости; до трёх попыток исправить предложение модели.
+- Постоянная память, точный подсчёт токенов, автоматическое сжатие и восстановление версий.
+- Чат с немедленным отображением отправленного сообщения и повтором при ошибке.
+- Черновик нового проекта на 24 часа; интерфейс для компьютера и телефона.
+- Отдельный демонстрационный режим без AI и ключей.
 
-## Установка
+[Демо интерфейса](https://taskmaster-matrix-design-razun.safeelf65.chatgpt.site) ·
+[Архитектура](docs/architecture.md) · [Планирование и API](docs/planning-api.md) ·
+[Память](docs/memory-api.md) · [Миграции](docs/database.md)
 
-### Локально
+## Быстрый запуск
 
-```bash
-pip install -r requirements.txt
+Python 3.12+ и Node.js для тестов интерфейса. Приложению Node.js не требуется.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+Copy-Item .env.example .env
+# Заполните YANDEX_API_KEY и YANDEX_FOLDER_ID в .env.
+.\scripts\run-local.ps1
 ```
 
-Создайте `.env`:
+Откройте `http://127.0.0.1:8000`. По умолчанию скрипт использует SQLite
+в `.local/deadline.db`. Изменения схемы применяются через Alembic при запуске.
+`/docs` содержит схемы API; `?demo=1` включает пример без запросов к модели.
 
-```
-YANDEX_API_KEY=ваш_ключ
-YANDEX_FOLDER_ID=ваш_folder_id
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/taskmaster
-```
+Для PostgreSQL создайте базу `taskmaster`, задайте `DATABASE_URL` в `.env` и запустите:
 
-Убедитесь, что PostgreSQL запущен, и создайте БД:
-
-```bash
-psql -U postgres -c "CREATE DATABASE taskmaster;"
+```powershell
+.\scripts\run-local.ps1 -UsePostgres
 ```
 
-### Docker
+Инструкция получения ключа — [Yandex AI Studio](https://aistudio.yandex.ru/ru/docs/ai-studio/operations/get-api-key).
+Сервисному аккаунту нужна роль `ai.languageModels.user`, ключу — область
+`yc.ai.languageModels.execute`. Ключ хранится на сервере; `.env` исключён из Git и Docker.
+
+## Docker
 
 ```bash
 docker compose up --build
 ```
 
-БД разворачивается автоматически, миграции на старте — `init_db()`.
+Откройте `http://127.0.0.1:8000`. Compose запускает PostgreSQL 16 с постоянным томом,
+проверяет готовность базы и запускает приложение с миграциями. База доступна внутри
+сети Compose и не занимает порт установленного локально PostgreSQL.
 
-## Запуск
+## Настройки контекста
 
-### CLI (интерактивный)
+```dotenv
+CONTEXT_BUDGET_TOKENS=16000
+RESPONSE_RESERVE_TOKENS=2000
+CONTEXT_COMPRESSION_THRESHOLD=0.75
+```
+
+Перед каждым обращением агента проекта токенизатор считает полный ввод. При достижении
+75% бюджета вместе с резервом на ответ агент сжимает накопленный диалог. Исходные
+сообщения и версии до/после сохраняются. Свежий запрос, факты проекта и данные плана
+остаются в контексте. Если даже сжатый запрос не помещается, сервер отклоняет его
+без отправки на генерацию. Бюджет — настройка приложения, а не бесплатная квота провайдера.
+Подробнее — [управление памятью](docs/memory-api.md).
+
+## Проверки
 
 ```bash
-python main.py
+python -m ruff check
+python -m mypy src/
+python -m pytest -q
+node --test frontend/tests/*.test.mjs
+python -m alembic check
 ```
 
-Команды в режиме диалога:
-- `/show` — показать матрицу
-- `/delete <id>` — удалить задачу
-- `/move <id> <квадрант>` — переместить задачу
-- `/export` — экспорт в Excel
+`requirements-dev.txt` включает инструменты разработки; `requirements.txt` — зависимости
+приложения. Тесты используют подменённые ответы модели, внешние HTTP-запросы заблокированы.
+Для проверки на PostgreSQL задайте `TEST_DATABASE_URL` (тот же формат, что у `DATABASE_URL`)
+и повторите pytest. Каждый тест получает отдельную временную схему, которая затем удаляется.
+CI выполняет проверки кода, обе базы, миграции и тесты интерфейса.
 
-### CLI (однострочные команды)
+## Устройство проекта
 
-```bash
-python main.py show
-python main.py delete 5
-python main.py move 3 1
-python main.py export
+```text
+src/                 FastAPI, агент, проверка планов, память и модели данных
+frontend/dist/       интерфейс без сборки, отдельный demo.js
+frontend/tests/      тесты черновиков формы
+migrations/          версионированные изменения схемы Alembic
+scripts/             локальный запуск
+tests/               сценарии API, состояния, контекста и миграций
+docs/                архитектура, API, запуск и демонстрационный сценарий
 ```
 
-### API-сервер
+Стек: Python, FastAPI, Pydantic, SQLAlchemy async, Alembic, PostgreSQL/SQLite,
+YandexGPT, HTML/CSS/JavaScript. Старый матричный агент и CLI сохранены:
+[инструкция прежней версии](docs/legacy.md).
 
-```bash
-python main.py serve
-```
-
-Сервер запустится на `http://127.0.0.1:8000`.
-
-| Метод | Путь | Описание |
-|-------|------|----------|
-| `GET`  | `/health` | Проверка |
-| `POST` | `/api/process` | Отправить текст агенту |
-| `GET`  | `/api/matrix` | Вся матрица |
-| `GET`  | `/api/matrix/{q}` | Квадрант 1-4 |
-| `DELETE` | `/api/tasks/{id}` | Удалить задачу |
-| `PATCH` | `/api/tasks/{id}/move` | Переместить задачу |
-| `POST` | `/api/export` | Экспорт в Excel |
-
-Пример запроса к агенту:
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/process \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Купить корм коту завтра"}'
-```
-
-## Тесты
-
-```bash
-pytest -v
-```
-
-## Структура
-
-```
-main.py              — точка входа (CLI + serve)
-Dockerfile           — образ приложения
-docker-compose.yml   — app + PostgreSQL
-.github/workflows/   — CI
-src/
-  config.py          — pydantic-settings
-  logger.py          — логирование
-  agent.py           — логика агента + YandexGPT
-  tools.py           — работа с БД и Excel
-  database.py        — SQLAlchemy async модели и CRUD
-  server.py          — FastAPI ручки
-tests/
-  conftest.py        — фикстуры (SQLite)
-  test_tools.py      — тесты
-```
+Приложение рассчитано на локальную работу одного пользователя. Публичный многопользовательский
+запуск потребует авторизации и проверки доступа. Проверка времени детерминирована;
+смысловая полнота требований и качество оценок модели требуют внимания пользователя.
+[Сценарий показа и границы](docs/demo.md).

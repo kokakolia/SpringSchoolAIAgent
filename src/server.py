@@ -1,21 +1,31 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src import database
 from src.agent import TaskMasterAgent
+from src.project_routes import router as project_router
 from src.tools import export_to_excel
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await database.init_db()
-    yield
+    try:
+        yield
+    finally:
+        if database._async_engine is not None:
+            await database._async_engine.dispose()
+        database._async_engine = None
+        database._async_session_maker = None
 
 
-app = FastAPI(title="AI Task Master API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="До дедлайна API", version="1.0.0", lifespan=lifespan)
+app.include_router(project_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,6 +48,17 @@ class MoveRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/runtime")
+async def runtime():
+    from src.config import settings
+
+    return {
+        "service": "deadline",
+        "mode": "live",
+        "model_configured": bool(settings.yandex_api_key and settings.yandex_folder_id),
+    }
 
 
 @app.post("/api/process")
@@ -84,3 +105,8 @@ async def move_task_route(task_id: int, body: MoveRequest, user_id: int = 1):
 async def export(user_id: int = 1):
     await export_to_excel(user_id=user_id)
     return {"message": "Экспортировано в matrix.xlsx"}
+
+
+frontend = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if frontend.is_dir():
+    app.mount("/", StaticFiles(directory=frontend, html=True), name="frontend")
