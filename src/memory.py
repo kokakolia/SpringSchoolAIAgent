@@ -16,6 +16,7 @@ from src.llm import YandexClient
 from src.memory_models import (
     ContextVersion,
     Message,
+    ModelOperation,
     PlanVersion,
     Project,
     ProjectEvent,
@@ -24,6 +25,7 @@ from src.memory_models import (
     new_id,
 )
 from src.memory_schemas import CreateProject, MemorySummary, SendMessage, UpdateProject
+from src.model_operations import serialized_model_operation
 
 AGENT_PROMPT = """Ты — агент «До дедлайна». Помоги довести проект до проверяемого результата.
 Уточняй цель, критерии успеха, дедлайн и доступное рабочее время. При недостатке
@@ -37,9 +39,10 @@ AGENT_PROMPT = """Ты — агент «До дедлайна». Помоги д
 
 
 class MemoryError(Exception):
-    def __init__(self, detail: str, status: int = 409):
+    def __init__(self, detail: str, status: int = 409, code: str | None = None):
         self.detail = detail
         self.status = status
+        self.code = code
 
 
 def estimate_tokens(messages: list[dict]) -> int:
@@ -212,7 +215,14 @@ async def delete_project(project_id: str, revision: int):
         check_revision(project, revision)
         # Lock this revision before removing children. Concurrent model replies fail CAS.
         await advance(session, project_id, revision)
-        for model in (Message, ContextVersion, PlanVersion, TaskProgress, ProjectEvent):
+        for model in (
+            ModelOperation,
+            Message,
+            ContextVersion,
+            PlanVersion,
+            TaskProgress,
+            ProjectEvent,
+        ):
             await session.execute(delete(model).where(model.project_id == project_id))
         await session.execute(delete(Project).where(Project.id == project_id))
         await session.commit()
@@ -254,11 +264,12 @@ async def list_messages(project_id: str):
         ]
 
 
+@serialized_model_operation
 async def send_message(project_id: str, body: SendMessage, client: YandexClient):
     from src.context_budget import ContextGuard
 
     if body.text == "/compress":
-        return await compress_context(project_id, str(body.request_id), body.base_revision, client)
+        return await _compress_context(project_id, str(body.request_id), body.base_revision, client)
     async with database._get_session_maker()() as session:
         project = await require_project(session, project_id)
         previous = (
@@ -301,7 +312,7 @@ async def send_message(project_id: str, body: SendMessage, client: YandexClient)
     return {"response": text, "revision": body.base_revision + 1, "usage": usage, "replayed": False}
 
 
-async def compress_context(project_id: str, request_id: str, revision: int, client: YandexClient):
+async def _compress_context(project_id: str, request_id: str, revision: int, client: YandexClient):
     async with database._get_session_maker()() as session:
         project = await require_project(session, project_id)
         existing = await session.scalar(
@@ -354,6 +365,9 @@ async def compress_context(project_id: str, request_id: str, revision: int, clie
         session.add_all([before, after])
         await session.commit()
         return {"context": version_dict(after), "revision": revision + 1, "replayed": False}
+
+
+compress_context = serialized_model_operation(_compress_context)
 
 
 async def list_versions(project_id: str):

@@ -90,3 +90,26 @@ def test_incompatible_existing_schema_is_reported():
         with pytest.raises(RuntimeError, match="Схема базы отличается"):
             upgrade(connection)
     engine.dispose()
+
+
+def test_budget_debit_migration_keeps_existing_completed_progress():
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        command.upgrade(config(connection), "0002_utc_timestamps")
+        connection.execute(
+            text(
+                "INSERT INTO projects(id,title,state,revision,created_at) "
+                "VALUES ('p','Old','{}',1,'2026-10-29')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO project_task_progress(project_id,task_id,done,pinned,spent_minutes) "
+                "VALUES ('p','task',1,0,50)"
+            )
+        )
+        upgrade(connection)
+        assert connection.execute(
+            text("SELECT spent_minutes,debited_minutes FROM project_task_progress")
+        ).one() == (50, 50)
+    engine.dispose()

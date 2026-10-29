@@ -85,13 +85,30 @@ def validate_plan(
                     "Закреплённую или завершённую задачу нельзя менять",
                     protected.id,
                 )
+            if flags.get("done") and set(protected.depends_on) != set(old.get("depends_on", [])):
+                error(
+                    "completed_dependencies",
+                    "Нельзя менять зависимости выполненной задачи",
+                    old["id"],
+                )
+    # Validate the complete graph, including completed and deferred tasks.
+    pending = {key: set(task.depends_on) & tasks.keys() for key, task in tasks.items()}
+    while pending:
+        roots = {key for key, dependencies in pending.items() if not dependencies}
+        if not roots:
+            error("dependency_cycle", "В графе задач обнаружен цикл зависимостей")
+            break
+        pending = {
+            key: dependencies - roots for key, dependencies in pending.items() if key not in roots
+        }
     order = []
     satisfied = set(done)
     remaining = dict(active)
     while remaining:
         eligible = [t for t in remaining.values() if set(t.depends_on) <= satisfied]
         if not eligible:
-            error("dependency_cycle", "Зависимости не позволяют выполнить оставшиеся задачи")
+            if not any(item["code"] == "dependency_cycle" for item in errors):
+                error("dependency_cycle", "Зависимости не позволяют выполнить оставшиеся задачи")
             break
         task = min(eligible, key=lambda t: {"must": 0, "should": 1, "could": 2}[t.priority])
         order.append(task)

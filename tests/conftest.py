@@ -3,6 +3,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -12,6 +13,11 @@ from src.config import settings
 
 @pytest.fixture(autouse=True)
 def no_external_http(monkeypatch):
+    from src.access import auth_throttle
+
+    auth_throttle.clear()
+    monkeypatch.setattr(settings, "app_password", SecretStr(""))
+    monkeypatch.setattr(settings, "app_allow_http", False)
     original_client = httpx.AsyncClient
 
     def client(*args, **kwargs):

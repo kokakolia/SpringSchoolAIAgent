@@ -35,6 +35,14 @@ class Project(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class ModelOperation(Base):
+    __tablename__ = "project_model_operations"
+
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), primary_key=True)
+    owner: Mapped[str] = mapped_column(String(36))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Message(Base):
     __tablename__ = "project_messages"
     __table_args__ = (UniqueConstraint("project_id", "request_id", "role"),)
@@ -88,6 +96,7 @@ class TaskProgress(Base):
     done: Mapped[bool] = mapped_column(default=False)
     pinned: Mapped[bool] = mapped_column(default=False)
     spent_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    debited_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class ProjectEvent(Base):

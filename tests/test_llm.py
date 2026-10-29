@@ -60,6 +60,8 @@ async def test_complete_supports_response_envelopes_and_records_usage(monkeypatc
         {"alternatives": []},
         [],
         {"result": None},
+        {"alternatives": [{"status": "ALTERNATIVE_STATUS_FINAL", "message": {"text": 123}}]},
+        {"alternatives": [{"status": "ALTERNATIVE_STATUS_FINAL", "message": {"text": None}}]},
     ],
 )
 async def test_invalid_and_truncated_responses_fail_explicitly(monkeypatch, payload):
@@ -88,3 +90,54 @@ async def test_summary_rejects_invalid_json(monkeypatch):
     mock_provider(monkeypatch, handler)
     with pytest.raises(ModelUnavailable, match="некорректную краткую память"):
         await YandexClient().summarize([{"role": "user", "text": "Вопрос"}])
+
+
+async def test_oversized_history_is_summarized_losslessly_in_bounded_parts(monkeypatch):
+    from src.memory_schemas import MemorySummary
+
+    monkeypatch.setattr(settings, "context_budget_tokens", 1000)
+    monkeypatch.setattr(settings, "response_reserve_tokens", 100)
+    seen, carried = [], []
+
+    class ChunkClient(YandexClient):
+        async def count_tokens(self, messages):
+            return len(messages[-1]["text"]) + 100
+
+        async def complete(self, messages, *, json_mode=False):
+            assert json_mode
+            assert await self.count_tokens(messages) + 100 <= 1000
+            data = json.loads(messages[-1]["text"])
+            seen.extend(message["text"] for message in data["messages"])
+            carried.append(data["previous_summary"])
+            return MemorySummary(
+                goal="Ship", user_objections=["Keep animation"]
+            ).model_dump_json(), {}
+
+    original = [{"role": "user", "text": "x" * 2500}, {"role": "assistant", "text": "y" * 500}]
+    result = await ChunkClient().summarize(original)
+    assert "".join(seen) == "x" * 2500 + "y" * 500
+    assert carried[0] is None and all(item is not None for item in carried[1:])
+    assert result.user_objections == ["Keep animation"]
+    assert original[0]["text"] == "x" * 2500
+
+
+async def test_partial_compression_failure_never_returns_a_partial_summary(monkeypatch):
+    from src.memory_schemas import MemorySummary
+
+    monkeypatch.setattr(settings, "context_budget_tokens", 1000)
+    monkeypatch.setattr(settings, "response_reserve_tokens", 100)
+
+    class FailingClient(YandexClient):
+        calls = 0
+
+        async def count_tokens(self, messages):
+            return len(messages[-1]["text"]) + 100
+
+        async def complete(self, messages, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise ModelUnavailable("Synthetic failure")
+            return MemorySummary(goal="Ship").model_dump_json(), {}
+
+    with pytest.raises(ModelUnavailable, match="Synthetic failure"):
+        await FailingClient().summarize([{"role": "user", "text": "x" * 2500}])

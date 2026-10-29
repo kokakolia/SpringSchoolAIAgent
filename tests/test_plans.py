@@ -239,6 +239,49 @@ async def test_progress_spends_actual_time_and_keeps_completed_tasks():
     assert (await plans.workspace(pid))["project"]["state"]["available_minutes"] == 240
 
 
+@pytest.mark.parametrize("actual", [0, 40, 300])
+async def test_reopening_refunds_only_the_amount_debited(actual):
+    pid, _ = await accepted()
+    await plans.lose_time(pid, LoseTime(**operation(2).model_dump(), minutes=235))
+    await plans.change_task(
+        pid, "api", ChangeTask(**operation(3).model_dump(), done=True, actual_minutes=actual)
+    )
+    await plans.change_task(pid, "api", ChangeTask(**operation(4).model_dump(), done=False))
+    assert (await plans.workspace(pid))["project"]["state"]["available_minutes"] == 5
+
+
+def test_completed_and_deferred_cycles_are_not_accepted_as_valid_plans():
+    old = proposal()
+    cyclic = proposal()
+    cyclic.tasks[0].depends_on = ["ui"]
+    flags = {task.id: {"done": True} for task in cyclic.tasks}
+    errors = validate_plan(cyclic, state(), flags, old.model_dump())["errors"]
+    assert {"dependency_cycle", "completed_dependencies"} <= {e["code"] for e in errors}
+    for task in cyclic.tasks:
+        task.decision = "defer"
+        task.tradeoff = "Later"
+    assert "dependency_cycle" in {e["code"] for e in validate_plan(cyclic, state(), {})["errors"]}
+
+
+async def test_unknown_budget_does_not_create_a_future_refund():
+    from src.memory_schemas import UpdateProject
+
+    pid, _ = await accepted()
+    unknown = state()
+    unknown["available_minutes"] = None
+    await memory.update_project(
+        pid, UpdateProject(base_revision=2, state=ProjectState.model_validate(unknown))
+    )
+    await plans.change_task(pid, "api", ChangeTask(**operation(3).model_dump(), done=True))
+    known = state()
+    known["available_minutes"] = 50
+    await memory.update_project(
+        pid, UpdateProject(base_revision=4, state=ProjectState.model_validate(known))
+    )
+    await plans.change_task(pid, "api", ChangeTask(**operation(5).model_dump(), done=False))
+    assert (await memory.get_project(pid))["state"]["available_minutes"] == 50
+
+
 async def test_concurrent_change_discards_generated_plan():
     p = await project()
 
@@ -280,7 +323,7 @@ async def test_plan_api_and_static_frontend(monkeypatch):
     monkeypatch.setattr(YandexClient, "count_tokens", Client.count_tokens)
     p = await project()
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app), base_url="http://localhost"
     ) as api:
         response = await api.post(
             f"/api/projects/{p['id']}/plans/propose",

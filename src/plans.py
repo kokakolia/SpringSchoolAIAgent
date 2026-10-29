@@ -9,6 +9,7 @@ from src import database, memory
 from src.context_budget import ContextGuard
 from src.llm import ModelUnavailable, YandexClient
 from src.memory_models import Message, PlanVersion, ProjectEvent, TaskProgress, iso_utc
+from src.model_operations import serialized_model_operation
 from src.plan_schemas import ChangeTask, LoseTime, PlanProposal, ProposePlan
 from src.planner import plan_diff, same_plan, validate_plan
 
@@ -194,6 +195,7 @@ async def workspace(project_id):
         }
 
 
+@serialized_model_operation
 async def propose(project_id: str, body: ProposePlan, client: YandexClient):
     async with database._get_session_maker()() as session:
         project = await memory.require_project(session, project_id)
@@ -453,8 +455,10 @@ async def change_task(project_id, task_id, body: ChangeTask):
             )
             progress.spent_minutes = spent
             progress.done = True
+            progress.debited_minutes = 0
             if state.get("available_minutes") is not None:
-                state["available_minutes"] = max(0, state["available_minutes"] - spent)
+                progress.debited_minutes = min(state["available_minutes"], spent)
+                state["available_minutes"] -= progress.debited_minutes
         elif body.done is False and progress.done:
             if any(
                 flags.get(t["id"], {}).get("done") and task_id in t["depends_on"]
@@ -462,8 +466,12 @@ async def change_task(project_id, task_id, body: ChangeTask):
             ):
                 raise memory.MemoryError("Сначала верните в работу зависимые задачи", 422)
             if state.get("available_minutes") is not None:
-                state["available_minutes"] += progress.spent_minutes
-            progress.done, progress.spent_minutes = False, 0
+                state["available_minutes"] += (
+                    progress.debited_minutes
+                    if progress.debited_minutes is not None
+                    else progress.spent_minutes
+                )
+            progress.done, progress.spent_minutes, progress.debited_minutes = False, 0, 0
         if body.pinned is not None:
             progress.pinned = body.pinned
         await memory.advance(session, project_id, body.base_revision, state=state)

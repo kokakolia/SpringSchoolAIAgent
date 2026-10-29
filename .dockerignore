@@ -16,3 +16,5 @@ matrix.xlsx
 *.sqlite*
 *.dump
 *.log
+
+legacy-tasks.json

@@ -210,7 +210,7 @@ async def test_compress_command_is_not_stored_as_dialogue():
 
 async def test_api_validation_errors_metrics_and_provider_failures(monkeypatch):
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app), base_url="http://localhost"
     ) as api:
         response = await api.post(
             "/api/projects",

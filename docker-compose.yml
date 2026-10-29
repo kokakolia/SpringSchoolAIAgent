@@ -20,6 +20,9 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/taskmaster
+      APP_PASSWORD: ${APP_PASSWORD:?Set APP_PASSWORD in .env (at least 16 characters)}
+      # Host port is loopback-only; Docker's gateway is not a loopback peer.
+      APP_ALLOW_HTTP: "true"
     depends_on:
       db:
         condition: service_healthy

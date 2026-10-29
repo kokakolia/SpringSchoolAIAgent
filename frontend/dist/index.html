@@ -6,9 +6,9 @@
     <meta name="theme-color" content="#f7f6f2" />
     <meta
       name="description"
-      content="До дедлайна — агент, с которым можно спорить. Планы, компромиссы и память проекта."
+      content="Мой план лучше — агент, с которым можно спорить. Планы, компромиссы и память проекта."
     />
-    <title>До дедлайна — сохраним главное</title>
+    <title>Мой план лучше — агент планирования</title>
     <link
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%23e7794d'/%3E%3Cpath d='M12 13h16M12 20h12M12 27h8' stroke='white' stroke-width='3'/%3E%3C/svg%3E"
@@ -16,6 +16,7 @@
     <link rel="stylesheet" href="deadline.css" />
   </head>
   <body>
+    <noscript>Для работы приложения включите JavaScript в браузере.</noscript>
     <aside class="sidebar">
       <a class="brand" href="./"
         ><span class="brand-icon">↗</span>до дедлайна<span class="orange"
@@ -47,6 +48,11 @@
       <header class="topbar">
         <div>
           <strong id="top-title">Проект</strong>
+          <select
+            id="mobile-project-select"
+            aria-label="Выбрать проект"
+            hidden
+          ></select>
         </div>
         <div class="top-right">
           <button

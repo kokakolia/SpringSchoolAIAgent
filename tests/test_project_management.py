@@ -91,7 +91,9 @@ async def test_delete_removes_only_target_project_and_all_its_children():
     target, other = await populated("Delete"), await populated("Keep")
     other_counts = await counts(other["id"])
     assert all(number > 0 for number in await counts(target["id"]))
-    await database.save_tasks([{"title": "Legacy stays", "quadrant": 2}])
+    async with database._get_session_maker()() as session:
+        session.add(database.Task(title="Legacy stays", quadrant=2))
+        await session.commit()
     with pytest.raises(memory.MemoryError) as error:
         await memory.delete_project(target["id"], 0)
     assert error.value.status == 409
@@ -100,7 +102,8 @@ async def test_delete_removes_only_target_project_and_all_its_children():
     assert await counts(target["id"]) == [0] * 5
     assert await counts(other["id"]) == other_counts
     assert (await memory.list_projects()) == [other]
-    assert (await database.read_matrix())[2][0]["title"] == "Legacy stays"
+    async with database._get_session_maker()() as session:
+        assert (await session.scalar(select(database.Task))).title == "Legacy stays"
     with pytest.raises(memory.MemoryError) as error:
         await memory.get_project(target["id"])
     assert error.value.status == 404
@@ -133,7 +136,7 @@ async def test_rename_preserves_state_and_does_not_invalidate_pending_plan():
 async def test_project_management_api_validates_input_and_handles_last_project():
     p = await create()
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app), base_url="http://localhost"
     ) as api:
         url = f"/api/projects/{p['id']}"
         for payload in ({"base_revision": 0}, {"base_revision": 0, "title": "   "}):

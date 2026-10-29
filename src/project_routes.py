@@ -25,7 +25,10 @@ class MemoryRoute(APIRoute):
             try:
                 return await original(request)
             except memory.MemoryError as error:
-                raise HTTPException(error.status, error.detail) from error
+                detail = (
+                    {"message": error.detail, "code": error.code} if error.code else error.detail
+                )
+                raise HTTPException(error.status, detail) from error
             except ModelUnavailable as error:
                 raise HTTPException(503, str(error)) from error
 

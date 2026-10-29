@@ -19,3 +19,5 @@ REFLECTION.md
 *.sqlite3
 *.dump
 *.log
+
+legacy-tasks.json

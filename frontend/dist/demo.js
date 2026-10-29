@@ -337,10 +337,11 @@ export class Demo {
       if (!t.depends_on.every((dep) => d.progress[dep]?.done))
         throw Error("Сначала заверши задачи, от которых зависит эта");
       flags.spent_minutes = patch.actual_minutes ?? t.estimate_minutes;
-      d.project.state.available_minutes = Math.max(
-        0,
-        d.project.state.available_minutes - flags.spent_minutes,
+      flags.debited_minutes = Math.min(
+        d.project.state.available_minutes,
+        flags.spent_minutes,
       );
+      d.project.state.available_minutes -= flags.debited_minutes;
     }
     if (patch.done === false && flags.done) {
       if (
@@ -349,8 +350,10 @@ export class Demo {
         )
       )
         throw Error("Сначала верни зависимые задачи");
-      d.project.state.available_minutes += flags.spent_minutes;
+      d.project.state.available_minutes +=
+        flags.debited_minutes ?? flags.spent_minutes;
       flags.spent_minutes = 0;
+      flags.debited_minutes = 0;
     }
     Object.assign(flags, patch);
     d.progress[id] = flags;

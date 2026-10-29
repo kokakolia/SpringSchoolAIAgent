@@ -151,3 +151,34 @@ async def test_oversized_fixed_inputs_block_generation_without_truncation(monkey
     assert error.value.status == 413
     assert client.answers == [] and client.summaries == 0
     assert await memory.list_messages(p["id"]) == []
+
+
+async def test_long_first_reply_can_be_compressed_on_the_next_turn(monkeypatch):
+    from src.llm import SUMMARY_PROMPT
+
+    monkeypatch.setattr(settings, "context_budget_tokens", 1000)
+    monkeypatch.setattr(settings, "response_reserve_tokens", 100)
+
+    class ChunkClient(YandexClient):
+        chunks = 0
+
+        async def count_tokens(self, messages):
+            if messages[0]["text"] == SUMMARY_PROMPT:
+                return len(messages[-1]["text"]) + 50
+            return sum(len(m["text"]) for m in messages if m["role"] != "system") + 50
+
+        async def complete(self, messages, *, json_mode=False):
+            if json_mode:
+                self.chunks += 1
+                assert await self.count_tokens(messages) + 100 <= 1000
+                return MemorySummary(goal="Ship").model_dump_json(), {}
+            return "y" * 150, {}
+
+    p = await memory.create_project(CreateProject(title="Ship", state=ProjectState(goal="Ship")))
+    client = ChunkClient()
+    await memory.send_message(p["id"], turn(0, "x" * 700), client)
+    await memory.send_message(p["id"], turn(1, "Next"), client)
+    assert client.chunks > 1
+    assert (await memory.get_project(p["id"]))["revision"] == 2
+    assert len(await memory.list_versions(p["id"])) == 2
+    assert len(await memory.list_messages(p["id"])) == 4

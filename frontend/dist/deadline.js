@@ -1,3 +1,5 @@
+import { createApi } from "./api.js";
+import { ComposerDraftStore } from "./composer.js";
 import { Demo, exampleState } from "./demo.js";
 import { ProjectDraftStore, PROJECT_DRAFT_FIELDS } from "./drafts.js";
 import {
@@ -37,6 +39,7 @@ let mode = "live",
   demo = null,
   board = null,
   projectId = null,
+  composerProjectId = null,
   projects = [],
   messages = [],
   view = "plan",
@@ -50,6 +53,7 @@ let mode = "live",
   projectActionTarget = null,
   toastTimer;
 const projectDrafts = new ProjectDraftStore();
+const composerDrafts = new ComposerDraftStore();
 const acceptedNotices = new AcceptedNoticeStore();
 function toast(text) {
   $("toast").textContent = text;
@@ -57,41 +61,7 @@ function toast(text) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => $("toast").classList.remove("visible"), 5500);
 }
-async function api(path, body, method = "POST") {
-  const controller = new AbortController(),
-    timer = setTimeout(() => controller.abort(), 195000);
-  try {
-    const response = await fetch(path, {
-      method: body ? method : "GET",
-      headers: body ? { "Content-Type": "application/json" } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-    });
-    let data;
-    try {
-      data = await response.json();
-    } catch {
-      throw Error("Сервер вернул неожиданный ответ");
-    }
-    if (!response.ok) {
-      const detail = Array.isArray(data.detail)
-        ? data.detail.map((e) => e.msg).join("; ")
-        : data.detail;
-      const error = Error(detail || `Ошибка ${response.status}`);
-      error.status = response.status;
-      throw error;
-    }
-    return data;
-  } catch (error) {
-    if (error.name === "AbortError")
-      throw Error(
-        "Сервер не ответил вовремя. Проверь состояние перед повтором.",
-      );
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-}
+const api = createApi();
 const path = (suffix) => `/api/projects/${projectId}${suffix}`,
   op = () => ({
     request_id: crypto.randomUUID(),
@@ -175,7 +145,7 @@ async function run(
 function renderDisabled() {
   document
     .querySelectorAll(
-      "#replan,#send,#lose-time,#new-project,#mobile-new,#mobile-memory,#edit-project,#save-project,#compress,#exact-count,#create-first,#create-example,[data-accept],[data-check],[data-pin],[data-project],[data-restore],[data-retry],[data-dismiss],[data-dismiss-status]",
+      "#mobile-project-select,#replan,#send,#lose-time,#new-project,#mobile-new,#mobile-memory,#edit-project,#save-project,#compress,#exact-count,#create-first,#create-example,[data-accept],[data-check],[data-pin],[data-project],[data-restore],[data-retry],[data-dismiss],[data-dismiss-status]",
     )
     .forEach((b) => {
       b.disabled = working || b.dataset.unavailable === "true";
@@ -206,7 +176,15 @@ function dateText(value) {
     return "Дата не задана";
   }
 }
+function syncComposer() {
+  if (composerProjectId === projectId) return;
+  if (composerProjectId)
+    composerDrafts.save(composerProjectId, $("chat-input").value);
+  composerProjectId = projectId;
+  $("chat-input").value = projectId ? composerDrafts.load(projectId) : "";
+}
 function render() {
+  syncComposer();
   const p = board?.project,
     s = p?.state,
     display = displayedPlan(board, view),
@@ -227,6 +205,18 @@ function render() {
       .join(""),
   );
   $("top-title").textContent = p?.title || "Проект";
+  patchHTML(
+    $("mobile-project-select"),
+    projects
+      .map(
+        (project) =>
+          `<option value="${esc(project.id)}">${esc(project.title)}</option>`,
+      )
+      .join(""),
+  );
+  $("mobile-project-select").value = projectId || "";
+  $("mobile-project-select").hidden = projects.length < 2;
+  $("top-title").classList.toggle("has-project-selector", projects.length >= 2);
   $("project-title").textContent = p?.title || "Нет проектов";
   $("project-goal").textContent = s?.goal || "";
   $("capacity").textContent = time(s?.available_minutes);
@@ -503,14 +493,9 @@ function wireRows() {
       renderStatus();
     };
   });
-  document.querySelectorAll("[data-project]").forEach(
-    (b) =>
-      (b.onclick = () =>
-        run(async () => {
-          projectId = b.dataset.project;
-          view = "plan";
-        }, "Загрузка проекта…")),
-  );
+  document
+    .querySelectorAll("[data-project]")
+    .forEach((b) => (b.onclick = () => selectProject(b.dataset.project)));
   document
     .querySelectorAll("[data-detail]")
     .forEach((b) => (b.onclick = () => showTask(b.dataset.detail)));
@@ -539,6 +524,25 @@ function wireRows() {
         }, "Сохраняю принятую версию…")),
   );
 }
+function selectProject(next) {
+  if (working || next === projectId) return;
+  const previousId = projectId,
+    previousView = view;
+  return run(
+    async () => {
+      projectId = next;
+      view = "plan";
+    },
+    "Загрузка проекта…",
+    () => {
+      projectId = previousId;
+      view = previousView;
+      render();
+    },
+  );
+}
+$("mobile-project-select").onchange = (event) =>
+  selectProject(event.target.value);
 function showTask(id) {
   const record = displayedPlan(board, view),
     t = record?.proposal.tasks.find((t) => t.id === id);
@@ -605,7 +609,10 @@ function changeTask(id, patch) {
 }
 async function propose(text, { fromComposer = false } = {}) {
   if (!board || working) return;
-  if (fromComposer) $("chat-input").value = "";
+  if (fromComposer) {
+    $("chat-input").value = "";
+    composerDrafts.clear(projectId);
+  }
   if (text.trim() === "/compress") {
     await compress();
     return;
@@ -654,7 +661,7 @@ async function sendTurn(turn) {
     (error) => {
       turn.status = "failed";
       turn.error = error.message;
-      turn.conflict = error.status === 409;
+      turn.conflict = error.status === 409 && error.code !== "operation_busy";
       turn.syncOnly = completed;
     },
   );
@@ -663,7 +670,10 @@ async function sendTurn(turn) {
   scrollChatToBottom();
 }
 function focusChat(text = "") {
-  if (text) $("chat-input").value = text;
+  if (text) {
+    $("chat-input").value = text;
+    composerDrafts.save(projectId, text);
+  }
   $("chat").classList.add("open");
   $("chat-input").focus();
 }
@@ -693,6 +703,9 @@ $("close-chat").onclick = () => {
     $("mobile-chat").focus();
   } else $("chat-input").focus();
 };
+$("chat-input").addEventListener("input", () => {
+  composerDrafts.save(composerProjectId, $("chat-input").value);
+});
 $("chat-form").onsubmit = (e) => {
   e.preventDefault();
   const text = $("chat-input").value.trim();
@@ -857,8 +870,10 @@ $("confirm-delete-project").onclick = async () => {
       }
       outbox = outbox.filter((turn) => turn.projectId !== target.id);
       acceptedNotices.forget(target.id);
+      composerDrafts.clear(target.id);
       if (projectId === target.id) {
         projectId = null;
+        composerProjectId = null;
         board = null;
         messages = [];
         view = "plan";
@@ -947,6 +962,7 @@ $("project-form").addEventListener("change", () => {
 });
 $("project-dialog").addEventListener("close", saveProjectDraft);
 window.addEventListener("pagehide", () => {
+  composerDrafts.save(composerProjectId, $("chat-input").value);
   if ($("project-dialog").open) saveProjectDraft();
 });
 document.addEventListener("visibilitychange", () => {
@@ -973,52 +989,59 @@ $("create-example").onclick = () =>
 $("project-form").onsubmit = (e) => {
   e.preventDefault();
   if (working) return;
-  run(async () => {
-    const lines = (id) =>
-      $(id)
-        .value.split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean);
-    const windows = lines("form-windows").map((line) => {
-      const parts = line.split(" / ");
-      if (parts.length !== 2)
-        throw Error("Интервалы: начало / конец, каждый с часовым поясом");
-      return { start: parts[0], end: parts[1] };
-    });
-    const deadline = $("form-deadline").value + $("form-offset").value;
-    if (Number.isNaN(new Date(deadline).getTime()))
-      throw Error("Проверь дату и смещение часового пояса");
-    const state = {
-      goal: $("form-goal").value.trim(),
-      success_criteria: lines("form-success"),
-      constraints: lines("form-constraints"),
-      available_minutes: Number($("form-minutes").value),
-      deadline,
-      timezone: $("form-timezone").value.trim(),
-      work_windows: windows,
-    };
-    if (editing)
-      await api(
-        path(""),
-        {
-          base_revision: board.project.revision,
-          title: document.getElementById("form-title").value.trim(),
-          state,
-        },
-        "PATCH",
-      );
-    else {
-      const p = await api("/api/projects", {
-        title: $("form-title").value.trim(),
-        state,
+  $("form-error").textContent = "";
+  run(
+    async () => {
+      const lines = (id) =>
+        $(id)
+          .value.split("\n")
+          .map((s) => s.trim())
+          .filter(Boolean);
+      const windows = lines("form-windows").map((line) => {
+        const parts = line.split(" / ");
+        if (parts.length !== 2)
+          throw Error("Интервалы: начало / конец, каждый с часовым поясом");
+        return { start: parts[0], end: parts[1] };
       });
-      projectId = p.id;
-      newProjectDirty = false;
-      projectDrafts.clear();
-    }
-    $("project-dialog").close();
-    toast("Условия сохранены.");
-  }, "Сохраняю условия…");
+      const deadline = $("form-deadline").value + $("form-offset").value;
+      if (Number.isNaN(new Date(deadline).getTime()))
+        throw Error("Проверь дату и смещение часового пояса");
+      const state = {
+        goal: $("form-goal").value.trim(),
+        success_criteria: lines("form-success"),
+        constraints: lines("form-constraints"),
+        available_minutes: Number($("form-minutes").value),
+        deadline,
+        timezone: $("form-timezone").value.trim(),
+        work_windows: windows,
+      };
+      if (editing)
+        await api(
+          path(""),
+          {
+            base_revision: board.project.revision,
+            title: document.getElementById("form-title").value.trim(),
+            state,
+          },
+          "PATCH",
+        );
+      else {
+        const p = await api("/api/projects", {
+          title: $("form-title").value.trim(),
+          state,
+        });
+        projectId = p.id;
+        newProjectDirty = false;
+        projectDrafts.clear();
+      }
+      $("project-dialog").close();
+      toast("Условия сохранены.");
+    },
+    "Сохраняю условия…",
+    (error) => {
+      $("form-error").textContent = error.message;
+    },
+  );
 };
 document
   .querySelectorAll("[data-close]")

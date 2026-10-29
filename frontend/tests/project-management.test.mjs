@@ -2,6 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Demo } from "../dist/demo.js";
 
+test("reopening an over-budget task returns only the original available balance", (t) => {
+  storage(t);
+  const demo = new Demo();
+  demo.data.project.state.available_minutes = 5;
+  demo.task("api", { done: true });
+  assert.equal(demo.data.project.state.available_minutes, 0);
+  demo.task("api", { done: false });
+  assert.equal(demo.data.project.state.available_minutes, 5);
+});
+
 function storage(t) {
   const previous = globalThis.localStorage,
     values = new Map();

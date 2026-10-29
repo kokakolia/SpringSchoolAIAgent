@@ -2,6 +2,28 @@
 .topbar .mobile-tool {
   display: none;
 }
+#mobile-project-select {
+  display: none;
+}
+@media (max-width: 650px) {
+  #mobile-project-select:not([hidden]) {
+    display: block;
+    width: 100%;
+    max-width: 190px;
+    min-width: 0;
+    border: 1px solid #dde4d2;
+    border-radius: 7px;
+    padding: 8px 22px 8px 8px;
+    background: #fafbf6;
+    color: var(--ink);
+    font: inherit;
+    font-size: 11px;
+    text-overflow: ellipsis;
+  }
+  #top-title.has-project-selector {
+    display: none;
+  }
+}
 @media (max-width: 650px) {
   .topbar .mobile-tool {
     display: flex;

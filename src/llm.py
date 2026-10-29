@@ -1,5 +1,7 @@
 """Yandex transport shared by dialogue, summarization and optional exact token counting."""
 
+import json
+
 import httpx
 
 from src.config import settings
@@ -12,6 +14,8 @@ goal (строка), confirmed_constraints, decisions, user_objections, open_que
 (массивы строк). Сохрани цель, обязательные ограничения, решения, возражения пользователя,
 нерешённые вопросы и оценки. Отличай подтверждённые факты от предположений.
 Учитывай изменения и отменённые решения. Не придумывай факты. Сократи объём существенно.
+Вход может содержать previous_summary: объедини её с очередной частью messages.
+Сообщения идут в хронологическом порядке; учитывай новые уточнения и отмены.
 """
 
 
@@ -62,23 +66,83 @@ class YandexClient:
             alternative = data["alternatives"][0]
             if alternative["status"] != "ALTERNATIVE_STATUS_FINAL":
                 raise ValueError("Incomplete completion")
-            text = alternative["message"]["text"].strip()
+            text = alternative["message"]["text"]
+            if not isinstance(text, str):
+                raise ValueError("Invalid completion text")
+            text = text.strip()
             if not text:
                 raise ValueError("Empty completion")
-            return text, data.get("usage", {})
+            usage = data.get("usage", {})
+            return text, usage if isinstance(usage, dict) else {}
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise ModelUnavailable("Модель не вернула завершённый текстовый ответ") from error
 
     async def summarize(self, messages: list[dict]) -> MemorySummary:
-        import json
+        remaining = [dict(message) for message in messages]
+        summary = None
+        parts = 0
+        while remaining:
+            if parts >= settings.max_compression_parts:
+                raise ModelUnavailable("Превышен лимит частей сжатия. Исходная память сохранена")
 
-        request = [
-            {"role": "system", "text": SUMMARY_PROMPT},
-            {"role": "user", "text": json.dumps(messages, ensure_ascii=False)},
-        ]
-        count = await self.count_tokens(request)
-        if count + settings.response_reserve_tokens > settings.context_budget_tokens:
-            raise ModelUnavailable("Контекст слишком велик для безопасного сжатия за один запрос")
+            def request_for(chunk):
+                return [
+                    {"role": "system", "text": SUMMARY_PROMPT},
+                    {
+                        "role": "user",
+                        "text": json.dumps(
+                            {
+                                "previous_summary": summary.model_dump() if summary else None,
+                                "messages": chunk,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ]
+
+            async def fits(request):
+                count = await self.count_tokens(request)
+                return count + settings.response_reserve_tokens <= settings.context_budget_tokens
+
+            request = request_for(remaining)
+            if await fits(request):
+                return await self._summarize_request(request)
+            # Prefer boundaries between complete messages.
+            low, high, cut = 1, len(remaining) - 1, 0
+            selected = None
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = request_for(remaining[:middle])
+                if await fits(candidate):
+                    cut, selected = middle, candidate
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if cut:
+                remaining = remaining[cut:]
+            else:
+                # A single old message may itself exceed the compression budget.
+                first = remaining[0]
+                source = first.get("text", "")
+                low, high, cut = 1, len(source) - 1, 0
+                while low <= high:
+                    middle = (low + high) // 2
+                    candidate = request_for([{**first, "text": source[:middle]}])
+                    if await fits(candidate):
+                        cut, selected = middle, candidate
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+                if not cut:
+                    raise ModelUnavailable("Бюджета недостаточно для инструкции сжатия и ответа")
+                remaining[0] = {**first, "text": source[cut:]}
+            summary = await self._summarize_request(selected)
+            parts += 1
+        if summary is None:
+            raise ModelUnavailable("Нет данных для сжатия")
+        return summary
+
+    async def _summarize_request(self, request) -> MemorySummary:
         text, _ = await self.complete(request, json_mode=True)
         try:
             return MemorySummary.model_validate_json(text)

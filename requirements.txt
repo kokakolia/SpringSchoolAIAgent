@@ -1,11 +1,10 @@
-openpyxl
-httpx
-pydantic-settings
-typer
-fastapi
-uvicorn
-sqlalchemy[asyncio]>=2.0,<2.1
-asyncpg
-aiosqlite
-tzdata
-alembic>=1.13,<2
+# Runtime versions validated by the project test suite.
+httpx==0.28.1
+pydantic-settings==2.16.2
+fastapi==0.162.0
+uvicorn==0.54.0
+sqlalchemy[asyncio]==2.0.55
+asyncpg==0.32.0
+aiosqlite==0.22.1
+tzdata==2026.6
+alembic==1.20.1
