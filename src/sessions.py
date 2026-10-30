@@ -23,53 +23,74 @@ def credential_verifier(username, password, salt):
     ).hex()
 
 
-async def credential_generation(session):
-    for _ in range(8):
-        row = await session.get(AuthCredentials, 1, populate_existing=True)
-        if row is None:
-            salt = secrets.token_hex(32)
-            session.add(
-                AuthCredentials(
-                    id=1,
-                    salt=salt,
-                    generation=1,
-                    verifier=credential_verifier(
-                        settings.app_username, settings.app_password.get_secret_value(), salt
-                    ),
-                )
-            )
-            try:
-                await session.commit()
-                return 1
-            except IntegrityError:
-                await session.rollback()
-                continue
-        verifier = credential_verifier(
+class StaleCredentialsError(Exception):
+    """A worker cannot promote its own configuration to the database's authority."""
+
+
+def matches_credentials(row):
+    return hmac.compare_digest(
+        row.verifier,
+        credential_verifier(
             settings.app_username, settings.app_password.get_secret_value(), row.salt
+        ),
+    )
+
+
+async def initialize_credentials():
+    # Bootstrap only. Starting an old worker must never roll the central state back.
+    async with database._get_session_maker()() as session:
+        if await session.get(AuthCredentials, 1) is not None:
+            return
+        salt = secrets.token_hex(32)
+        session.add(
+            AuthCredentials(
+                id=1,
+                salt=salt,
+                generation=1,
+                verifier=credential_verifier(
+                    settings.app_username, settings.app_password.get_secret_value(), salt
+                ),
+            )
         )
-        if hmac.compare_digest(row.verifier, verifier):
-            return row.generation
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            if await session.get(AuthCredentials, 1) is None:
+                raise
+
+
+async def credentials_current():
+    async with database._get_session_maker()() as session:
+        row = await session.get(AuthCredentials, 1)
+        # No row exists only before bootstrap; session validation still fails closed.
+        return row is None or matches_credentials(row)
+
+
+async def rotate_credentials(expected_generation):
+    """Explicit administrative CAS, never called by request or startup paths."""
+    async with database._get_session_maker()() as session:
+        row = await session.get(AuthCredentials, 1)
+        if row is None or row.generation != expected_generation:
+            raise StaleCredentialsError("Версия учётных данных изменилась. Проверьте auth-status")
         generation = row.generation + 1
+        salt = secrets.token_hex(32)
         changed = await session.execute(
             update(AuthCredentials)
-            .where(
-                AuthCredentials.id == 1,
-                AuthCredentials.generation == row.generation,
-                AuthCredentials.verifier == row.verifier,
+            .where(AuthCredentials.id == 1, AuthCredentials.generation == expected_generation)
+            .values(
+                generation=generation,
+                salt=salt,
+                verifier=credential_verifier(
+                    settings.app_username, settings.app_password.get_secret_value(), salt
+                ),
             )
-            .values(generation=generation, verifier=verifier)
         )
-        if changed.rowcount:
-            await session.execute(delete(AuthSession))
-            await session.commit()
-            return generation
-        await session.rollback()
-    raise RuntimeError("Настройки входа меняются одновременно. Повторите запрос")
-
-
-async def sync_credentials():
-    async with database._get_session_maker()() as session:
-        await credential_generation(session)
+        if not changed.rowcount:
+            raise StaleCredentialsError("Версия учётных данных изменилась. Проверьте auth-status")
+        await session.execute(delete(AuthSession))
+        await session.commit()
+        return generation
 
 
 def cookie_name(request):
@@ -80,38 +101,44 @@ def digest(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def tag(token):
-    key = (settings.app_username + "\0" + settings.app_password.get_secret_value()).encode()
-    return hmac.new(key, token.encode(), hashlib.sha256).hexdigest()
+def tag(token, verifier):
+    return hmac.new(verifier.encode(), token.encode(), hashlib.sha256).hexdigest()
 
 
 async def valid_session(token):
+    if not token or len(token) != 43:
+        return False
     async with database._get_session_maker()() as session:
-        generation = await credential_generation(session)
-        if not token or len(token) != 43:
+        credentials = await session.get(AuthCredentials, 1)
+        if credentials is None:
             return False
         row = await session.get(AuthSession, digest(token))
-        if row is None or row.credential_generation != generation:
+        if row is None or row.credential_generation != credentials.generation:
             return False
         expires = (
             row.expires_at.replace(tzinfo=timezone.utc)
             if row.expires_at.tzinfo is None
             else row.expires_at
         )
-        return expires > utcnow() and hmac.compare_digest(row.auth_tag, tag(token))
+        return expires > utcnow() and hmac.compare_digest(
+            row.auth_tag, tag(token, credentials.verifier)
+        )
 
 
 async def issue_session():
+    await initialize_credentials()
     token = secrets.token_urlsafe(32)
     async with database._get_session_maker()() as session:
-        generation = await credential_generation(session)
+        credentials = await session.get(AuthCredentials, 1)
+        if credentials is None or not matches_credentials(credentials):
+            raise StaleCredentialsError("Настройки входа процесса устарели")
         await session.execute(delete(AuthSession).where(AuthSession.expires_at <= utcnow()))
         session.add(
             AuthSession(
                 token_hash=digest(token),
-                auth_tag=tag(token),
+                auth_tag=tag(token, credentials.verifier),
                 expires_at=utcnow() + timedelta(seconds=settings.auth_session_seconds),
-                credential_generation=generation,
+                credential_generation=credentials.generation,
             )
         )
         await session.commit()

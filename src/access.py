@@ -15,7 +15,9 @@ from starlette.responses import JSONResponse, RedirectResponse
 
 from src.config import settings
 from src.sessions import (
+    StaleCredentialsError,
     cookie_name,
+    credentials_current,
     issue_session,
     login_page,
     revoke_session,
@@ -193,8 +195,14 @@ class AccessMiddleware:
         else:
             password = settings.app_password.get_secret_value()
             local = bool(request.client and loopback(request.client.host))
-            if not password:
-                if not local or request.url.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            token = request.cookies.get(cookie_name(request))
+            authenticated = await valid_session(token)
+            if not password and not authenticated:
+                if not await credentials_current():
+                    error = JSONResponse(
+                        {"detail": "Настройки входа процесса устарели"}, status_code=503
+                    )
+                elif not local or request.url.hostname not in {"localhost", "127.0.0.1", "::1"}:
                     error = JSONResponse(
                         {"detail": "Внешний доступ отключён. Настройте APP_PASSWORD и HTTPS"},
                         status_code=403,
@@ -204,8 +212,6 @@ class AccessMiddleware:
                     {"detail": "Для внешнего доступа требуется HTTPS"}, status_code=403
                 )
             else:
-                token = request.cookies.get(cookie_name(request))
-                authenticated = await valid_session(token)
                 if request.url.path == "/auth/logout" and request.method == "POST":
                     if authenticated:
                         await revoke_session(token)
@@ -240,6 +246,10 @@ class AccessMiddleware:
                         )
                         return await response(scope, receive, safe_send)
                     peer = request.client.host if request.client else "unknown"
+                    if not await credentials_current():
+                        return await JSONResponse(
+                            {"detail": "Настройки входа процесса устарели"}, status_code=503
+                        )(scope, receive, safe_send)
                     retry_after = auth_throttle.retry_after(peer)
                     if retry_after:
                         response = (
@@ -276,8 +286,13 @@ class AccessMiddleware:
                         if username is None:
                             return
                         if verify_password(username, supplied):
-                            new_session = await issue_session()
                             succeeded = True
+                            try:
+                                new_session = await issue_session()
+                            except StaleCredentialsError:
+                                return await JSONResponse(
+                                    {"detail": "Настройки входа процесса устарели"}, status_code=503
+                                )(scope, receive, safe_send)
                             if form_login:
                                 return await RedirectResponse("/", status_code=303)(
                                     scope, receive, safe_send
