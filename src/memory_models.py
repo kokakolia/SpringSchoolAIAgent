@@ -154,6 +154,16 @@ class AuthSession(Base):
     token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     auth_tag: Mapped[str] = mapped_column(String(64))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    credential_generation: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+
+
+class AuthCredentials(Base):
+    __tablename__ = "auth_credentials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    salt: Mapped[str] = mapped_column(String(64))
+    verifier: Mapped[str] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column(BigInteger)
 
 
 class OperationRecord(Base):

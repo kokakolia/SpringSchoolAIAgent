@@ -575,6 +575,12 @@ async def change_task(project_id, task_id, body: ChangeTask):
             if project.time_budget_minutes is not None:
                 progress.debited_minutes = spent
                 spent_delta = spent
+        elif body.done is True and progress.done and body.actual_minutes is not None:
+            # Correct the recorded charge by its difference; proofs and completion stay intact.
+            debit = body.actual_minutes if project.time_budget_minutes is not None else 0
+            spent_delta = debit - (progress.debited_minutes or 0)
+            progress.spent_minutes = body.actual_minutes
+            progress.debited_minutes = debit
         elif body.done is False and progress.done:
             if await completed_dependents(session, project_id, task_id):
                 raise memory.MemoryError("Сначала верните в работу зависимые задачи", 422)

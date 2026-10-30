@@ -13,6 +13,9 @@ from src.project_routes import router as project_router
 async def lifespan(app: FastAPI):
     try:
         await database.init_db()
+        from src.sessions import sync_credentials
+
+        await sync_credentials()
         yield
     finally:
         await database.close_db()

@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     auth_global_attempts_per_minute: int = Field(default=100, ge=1, le=1000)
     max_request_bytes: int = Field(default=1048576, ge=65536, le=4194304)
     auth_session_seconds: int = Field(default=43200, ge=300, le=604800)
+    auth_login_body_timeout_seconds: float = Field(default=5, gt=0, le=30)
+    auth_max_concurrent_logins: int = Field(default=8, ge=1, le=64)
 
     @model_validator(mode="after")
     def budget_has_room(self):

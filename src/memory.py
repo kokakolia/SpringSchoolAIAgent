@@ -319,6 +319,43 @@ async def list_messages(project_id: str):
         ]
 
 
+async def dialogue_work_state(session, project):
+    from src.task_integrity import progress_map, task_ids
+
+    head = await session.scalar(
+        select(PlanVersion)
+        .where(PlanVersion.project_id == project.id, PlanVersion.accepted_revision.is_not(None))
+        .order_by(PlanVersion.accepted_revision.desc())
+        .limit(1)
+    )
+    proposal = head.proposal if head else None
+    flags = await progress_map(session, project.id, task_ids(proposal))
+    events = (
+        await session.execute(
+            select(ProjectEvent.kind, ProjectEvent.payload, ProjectEvent.revision)
+            .where(ProjectEvent.project_id == project.id)
+            .order_by(ProjectEvent.revision.desc())
+            .limit(10)
+        )
+    ).all()
+    return {
+        "as_of_revision": project.revision,
+        "accepted_plan_id": head.id if head else None,
+        "accepted_plan": proposal,
+        "progress": {
+            tid: {
+                k: v
+                for k, v in value.items()
+                if k in {"done", "pinned", "spent_minutes", "archived"}
+            }
+            for tid, value in flags.items()
+        },
+        "events": [
+            {"kind": row.kind, "payload": row.payload, "revision": row.revision} for row in events
+        ],
+    }
+
+
 @serialized_model_operation
 async def send_message(project_id: str, body: SendMessage, client: YandexClient):
     from src.context_budget import ContextGuard
@@ -341,7 +378,13 @@ async def send_message(project_id: str, body: SendMessage, client: YandexClient)
             return {"response": previous[-1].text, "revision": project.revision, "replayed": True}
         check_revision(project, body.base_revision)
         guard = await ContextGuard.load(session, project, str(body.request_id), client)
-        messages = guard.context + [{"role": "user", "text": body.text}]
+        evidence = await dialogue_work_state(session, project)
+        messages = [dict(message) for message in guard.context]
+        messages[0]["text"] += (
+            "\nАктуальный принятый план и выполнение. Эти факты "
+            "приоритетнее старой переписки и сводки:\n" + json.dumps(evidence, ensure_ascii=False)
+        )
+        messages.append({"role": "user", "text": body.text})
     messages = await guard.prepare(messages)
     text, usage = await client.complete(messages)
     usage = {**usage, "context_checks": guard.checks}

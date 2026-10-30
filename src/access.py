@@ -1,5 +1,6 @@
 """Loopback-only by default; password-protected single-owner access over HTTPS."""
 
+import asyncio
 import base64
 import binascii
 import ipaddress
@@ -22,6 +23,8 @@ from src.sessions import (
     valid_session,
 )
 
+AUTH_CHALLENGE = 'Basic realm="Deadline", charset="UTF-8"'
+
 
 class AuthThrottle:
     """Bounded per-process counters; keys come from the trusted peer address, never usernames."""
@@ -33,6 +36,7 @@ class AuthThrottle:
         self.peers = OrderedDict()
         self.global_count = 0
         self.global_until = 0.0
+        self.pending = {}
 
     def retry_after(self, peer):
         now = time.monotonic()
@@ -42,14 +46,21 @@ class AuthThrottle:
         count, until = self.peers.get(peer, (0, now + 60))
         blocked_until = max(
             self.global_until
-            if self.global_count >= settings.auth_global_attempts_per_minute
+            if self.global_count + sum(self.pending.values())
+            >= settings.auth_global_attempts_per_minute
             else 0,
-            until if count >= settings.auth_attempts_per_minute and now < until else 0,
+            until
+            if (count if now < until else 0) + self.pending.get(peer, 0)
+            >= settings.auth_attempts_per_minute
+            else 0,
         )
         return max(0, math.ceil(blocked_until - now))
 
     def failed(self, peer):
         now = time.monotonic()
+        if now >= self.global_until:
+            self.global_count = 0
+            self.global_until = now + 60
         self.global_count += 1
         count, until = self.peers.pop(peer, (0, now + 60))
         if now >= until:
@@ -58,8 +69,17 @@ class AuthThrottle:
         while len(self.peers) > 2048:
             self.peers.popitem(last=False)
 
-    def succeeded(self, peer):
-        self.peers.pop(peer, None)
+    def started(self, peer):
+        self.pending[peer] = self.pending.get(peer, 0) + 1
+
+    def finished(self, peer, succeeded):
+        count = self.pending[peer] - 1
+        if count:
+            self.pending[peer] = count
+        else:
+            self.pending.pop(peer)
+        if not succeeded:
+            self.failed(peer)
 
 
 auth_throttle = AuthThrottle()
@@ -93,6 +113,45 @@ def verify_password(username, supplied):
         supplied.encode(), settings.app_password.get_secret_value().encode()
     )
     return valid_user and valid_password
+
+
+class LoginBodyError(Exception):
+    def __init__(self, detail, status):
+        self.detail, self.status = detail, status
+
+
+async def login_credentials(header, form_login, receive):
+    username, supplied = "", ""
+    if form_login:
+        raw = bytearray()
+        try:
+            # One deadline covers the entire body, including a slow stream of small chunks.
+            async with asyncio.timeout(settings.auth_login_body_timeout_seconds):
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return None, None
+                    raw.extend(message.get("body", b""))
+                    if len(raw) > 4096:
+                        raise LoginBodyError("Слишком большой запрос входа", 413)
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:
+            raise LoginBodyError("Время отправки данных входа истекло", 408) from None
+        try:
+            values = parse_qs(raw.decode("utf-8"), max_num_fields=4)
+            username = values.get("username", [""])[0]
+            supplied = values.get("password", [""])[0]
+        except (UnicodeDecodeError, ValueError):
+            pass
+    elif header.lower().startswith("basic ") and len(header) <= 4096:
+        try:
+            username, supplied = (
+                base64.b64decode(header[6:], validate=True).decode("utf-8").split(":", 1)
+            )
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            pass
+    return username, supplied
 
 
 class AccessMiddleware:
@@ -174,9 +233,7 @@ class AccessMiddleware:
                             JSONResponse(
                                 {"detail": "Требуется вход"},
                                 status_code=401,
-                                headers={
-                                    "WWW-Authenticate": 'Basic realm="Deadline", charset="UTF-8"'
-                                },
+                                headers={"WWW-Authenticate": AUTH_CHALLENGE},
                             )
                             if request.url.path.startswith("/api/")
                             else RedirectResponse("/auth/login", status_code=303)
@@ -194,58 +251,49 @@ class AccessMiddleware:
                         )
                         response.headers["Retry-After"] = str(retry_after)
                         return await response(scope, receive, safe_send)
-                    # Reserve an attempt before parsing or comparing the password.
-                    auth_throttle.failed(peer)
-                    username, supplied = "", ""
-                    if form_login:
-                        raw = bytearray()
-                        while True:
-                            message = await receive()
-                            if message["type"] == "http.disconnect":
-                                return
-                            raw.extend(message.get("body", b""))
-                            if len(raw) > 4096:
-                                return await JSONResponse(
-                                    {"detail": "Слишком большой запрос входа"}, status_code=413
-                                )(scope, receive, safe_send)
-                            if not message.get("more_body", False):
-                                break
+                    if sum(auth_throttle.pending.values()) >= settings.auth_max_concurrent_logins:
+                        return await JSONResponse(
+                            {"detail": "Вход временно занят. Повторите через несколько секунд"},
+                            status_code=503,
+                            headers={"Retry-After": "1"},
+                        )(scope, receive, safe_send)
+                    # Reserve capacity before any await, then release it on every exit path.
+                    auth_throttle.started(peer)
+                    succeeded = False
+                    try:
                         try:
-                            values = parse_qs(raw.decode("utf-8"), max_num_fields=4)
-                            username, supplied = (
-                                values.get("username", [""])[0],
-                                values.get("password", [""])[0],
+                            username, supplied = await login_credentials(
+                                header, form_login, receive
                             )
-                        except (UnicodeDecodeError, ValueError):
-                            pass
-                    elif header.lower().startswith("basic ") and len(header) <= 4096:
-                        try:
-                            username, supplied = (
-                                base64.b64decode(header[6:], validate=True)
-                                .decode("utf-8")
-                                .split(":", 1)
+                        except LoginBodyError as exc:
+                            return await JSONResponse(
+                                {"detail": exc.detail},
+                                status_code=exc.status,
+                                headers={"Connection": "close"}
+                                if scope.get("http_version") in {"1.0", "1.1"}
+                                else {},
+                            )(scope, receive, safe_send)
+                        if username is None:
+                            return
+                        if verify_password(username, supplied):
+                            new_session = await issue_session()
+                            succeeded = True
+                            if form_login:
+                                return await RedirectResponse("/", status_code=303)(
+                                    scope, receive, safe_send
+                                )
+                        else:
+                            error = (
+                                login_page("Неверное имя пользователя или пароль", 401)
+                                if form_login
+                                else JSONResponse(
+                                    {"detail": "Требуется вход"},
+                                    status_code=401,
+                                    headers={"WWW-Authenticate": AUTH_CHALLENGE},
+                                )
                             )
-                        except (binascii.Error, UnicodeDecodeError, ValueError):
-                            pass
-                    if verify_password(username, supplied):
-                        auth_throttle.succeeded(peer)
-                        new_session = await issue_session()
-                        if form_login:
-                            return await RedirectResponse("/", status_code=303)(
-                                scope, receive, safe_send
-                            )
-                    else:
-                        error = (
-                            login_page("Неверное имя пользователя или пароль", 401)
-                            if form_login
-                            else JSONResponse(
-                                {"detail": "Требуется вход"},
-                                status_code=401,
-                                headers={
-                                    "WWW-Authenticate": 'Basic realm="Deadline", charset="UTF-8"'
-                                },
-                            )
-                        )
+                    finally:
+                        auth_throttle.finished(peer, succeeded)
         if error is not None:
             return await error(scope, receive, safe_send)
         if scope["method"] in {"POST", "PUT", "PATCH", "DELETE"}:

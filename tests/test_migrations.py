@@ -115,6 +115,30 @@ def test_budget_debit_migration_keeps_existing_completed_progress():
     engine.dispose()
 
 
+def test_credential_migration_revokes_legacy_sessions_without_touching_projects():
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        command.upgrade(config(connection), "0006_sessions_requirements")
+        connection.execute(
+            text(
+                "INSERT INTO projects(id,title,state,revision,created_at) "
+                "VALUES ('p','Keep this project','{}',7,'2026-10-29')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO auth_sessions(token_hash,auth_tag,expires_at) "
+                "VALUES (:token,:tag,'2030-11-01')"
+            ),
+            {"token": "1" * 64, "tag": "2" * 64},
+        )
+        upgrade(connection)
+        assert connection.scalar(text("SELECT count(*) FROM auth_sessions")) == 0
+        assert connection.scalar(text("SELECT revision FROM projects WHERE id='p'")) == 7
+        command.check(config(connection))
+    engine.dispose()
+
+
 def test_time_ledger_migration_preserves_legacy_balance_and_known_losses():
     import json
 

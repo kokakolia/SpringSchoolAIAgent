@@ -26,6 +26,8 @@ async def test_sessions_expire_and_password_change_revokes_existing_token(monkey
     monkeypatch.setattr(settings, "app_password", SecretStr("a-different-test-password"))
     assert not await sessions.valid_session(token)
     monkeypatch.setattr(settings, "app_password", SecretStr("a-test-session-password"))
+    assert not await sessions.valid_session(token)
+    token = await sessions.issue_session()
     async with database._get_session_maker()() as session:
         row = await session.get(AuthSession, sessions.digest(token))
         row.expires_at = utcnow() - timedelta(seconds=1)

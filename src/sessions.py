@@ -4,14 +4,72 @@ import hashlib
 import hmac
 import secrets
 from datetime import timedelta, timezone
+from functools import lru_cache
 from html import escape
 
-from sqlalchemy import delete
+from sqlalchemy import delete, update
+from sqlalchemy.exc import IntegrityError
 from starlette.responses import HTMLResponse, Response
 
 from src import database
 from src.config import settings
-from src.memory_models import AuthSession, utcnow
+from src.memory_models import AuthCredentials, AuthSession, utcnow
+
+
+@lru_cache(maxsize=4)
+def credential_verifier(username, password, salt):
+    return hashlib.pbkdf2_hmac(
+        "sha256", (username + "\0" + password).encode(), bytes.fromhex(salt), 200000
+    ).hex()
+
+
+async def credential_generation(session):
+    for _ in range(8):
+        row = await session.get(AuthCredentials, 1, populate_existing=True)
+        if row is None:
+            salt = secrets.token_hex(32)
+            session.add(
+                AuthCredentials(
+                    id=1,
+                    salt=salt,
+                    generation=1,
+                    verifier=credential_verifier(
+                        settings.app_username, settings.app_password.get_secret_value(), salt
+                    ),
+                )
+            )
+            try:
+                await session.commit()
+                return 1
+            except IntegrityError:
+                await session.rollback()
+                continue
+        verifier = credential_verifier(
+            settings.app_username, settings.app_password.get_secret_value(), row.salt
+        )
+        if hmac.compare_digest(row.verifier, verifier):
+            return row.generation
+        generation = row.generation + 1
+        changed = await session.execute(
+            update(AuthCredentials)
+            .where(
+                AuthCredentials.id == 1,
+                AuthCredentials.generation == row.generation,
+                AuthCredentials.verifier == row.verifier,
+            )
+            .values(generation=generation, verifier=verifier)
+        )
+        if changed.rowcount:
+            await session.execute(delete(AuthSession))
+            await session.commit()
+            return generation
+        await session.rollback()
+    raise RuntimeError("Настройки входа меняются одновременно. Повторите запрос")
+
+
+async def sync_credentials():
+    async with database._get_session_maker()() as session:
+        await credential_generation(session)
 
 
 def cookie_name(request):
@@ -28,11 +86,12 @@ def tag(token):
 
 
 async def valid_session(token):
-    if not token or len(token) != 43:
-        return False
     async with database._get_session_maker()() as session:
+        generation = await credential_generation(session)
+        if not token or len(token) != 43:
+            return False
         row = await session.get(AuthSession, digest(token))
-        if row is None:
+        if row is None or row.credential_generation != generation:
             return False
         expires = (
             row.expires_at.replace(tzinfo=timezone.utc)
@@ -45,12 +104,14 @@ async def valid_session(token):
 async def issue_session():
     token = secrets.token_urlsafe(32)
     async with database._get_session_maker()() as session:
+        generation = await credential_generation(session)
         await session.execute(delete(AuthSession).where(AuthSession.expires_at <= utcnow()))
         session.add(
             AuthSession(
                 token_hash=digest(token),
                 auth_tag=tag(token),
                 expires_at=utcnow() + timedelta(seconds=settings.auth_session_seconds),
+                credential_generation=generation,
             )
         )
         await session.commit()
