@@ -238,7 +238,7 @@ async def test_api_validation_errors_metrics_and_provider_failures(monkeypatch):
             json={"request_id": str(uuid4()), "base_revision": 0, "text": "Привет"},
         )
         assert response.status_code == 503
-        assert (await api.get(f"/api/projects/{pid}/messages")).json() == []
+        assert (await api.get(f"/api/projects/{pid}/messages")).json()["items"] == []
         missing = await api.get(f"/api/projects/{uuid4()}")
         assert missing.status_code == 404
 

@@ -113,3 +113,43 @@ def test_budget_debit_migration_keeps_existing_completed_progress():
             text("SELECT spent_minutes,debited_minutes FROM project_task_progress")
         ).one() == (50, 50)
     engine.dispose()
+
+
+def test_time_ledger_migration_preserves_legacy_balance_and_known_losses():
+    import json
+
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        command.upgrade(config(connection), "0004_model_operations")
+        connection.execute(
+            text(
+                "INSERT INTO projects(id,title,state,revision,created_at) "
+                "VALUES ('p','Old',:state,3,'2026-10-29')"
+            ),
+            {"state": json.dumps({"available_minutes": 0})},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO project_task_progress"
+                "(project_id,task_id,done,pinned,spent_minutes,debited_minutes) "
+                "VALUES ('p','old',1,0,40,40)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO project_events"
+                "(id,project_id,request_id,kind,payload,revision,created_at) "
+                "VALUES ('e','p','r','time_lost',:payload,3,'2026-10-29')"
+            ),
+            {"payload": json.dumps({"minutes": 220})},
+        )
+        upgrade(connection)
+        assert connection.execute(
+            text("SELECT time_budget_minutes,time_lost_minutes,time_spent_minutes FROM projects")
+        ).one() == (260, 220, 40)
+        assert (
+            json.loads(connection.scalar(text("SELECT state FROM projects")))["available_minutes"]
+            == 0
+        )
+        command.check(config(connection))
+    engine.dispose()

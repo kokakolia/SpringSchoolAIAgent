@@ -5,7 +5,7 @@ import { Demo } from "../dist/demo.js";
 test("reopening an over-budget task returns only the original available balance", (t) => {
   storage(t);
   const demo = new Demo();
-  demo.data.project.state.available_minutes = 5;
+  demo.loseTime(355);
   demo.task("api", { done: true });
   assert.equal(demo.data.project.state.available_minutes, 0);
   demo.task("api", { done: false });
@@ -57,4 +57,16 @@ test("deletion remains empty after reload and opening the example restores a usa
   restored.restoreExample();
   assert.equal(restored.list().length, 1);
   assert.ok(restored.workspace().accepted);
+});
+
+test("demo preserves losses beyond zero when a completed task is reopened", (t) => {
+  storage(t);
+  const demo = new Demo();
+  demo.loseTime(120);
+  demo.task("api", { done: true });
+  assert.equal(demo.data.project.state.available_minutes, 200);
+  demo.loseTime(220);
+  assert.equal(demo.data.project.state.available_minutes, 0);
+  demo.task("api", { done: false });
+  assert.equal(demo.data.project.state.available_minutes, 20);
 });

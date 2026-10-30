@@ -1,3 +1,4 @@
+import { TimeLossStore, resumeTimeLoss } from "./time-loss.js";
 import { createApi } from "./api.js";
 import { ComposerDraftStore } from "./composer.js";
 import { Demo, exampleState } from "./demo.js";
@@ -42,6 +43,12 @@ let mode = "live",
   composerProjectId = null,
   projects = [],
   messages = [],
+  messageProjectId = null,
+  messagesHasMore = false,
+  historyProjectId = null,
+  historyItems = [],
+  historyOffset = 0,
+  historyHasMore = false,
   view = "plan",
   working = false,
   editing = false,
@@ -54,6 +61,7 @@ let mode = "live",
   toastTimer;
 const projectDrafts = new ProjectDraftStore();
 const composerDrafts = new ComposerDraftStore();
+const timeLosses = new TimeLossStore();
 const acceptedNotices = new AcceptedNoticeStore();
 function toast(text) {
   $("toast").textContent = text;
@@ -83,10 +91,30 @@ async function refresh({ loadProjects = true, loadMessages = true } = {}) {
       projectId = projects.find((p) => p.id === saved)?.id || projects[0]?.id;
     }
     if (projectId) {
-      [board, messages] = await Promise.all([
+      const [nextBoard, page] = await Promise.all([
         api(path("/workspace")),
-        loadMessages ? api(path("/messages")) : Promise.resolve(messages),
+        loadMessages ? api(path("/messages?limit=50")) : Promise.resolve(null),
       ]);
+      board = nextBoard;
+      if (page) {
+        const prior = messageProjectId === projectId ? messages : [];
+        messages = [
+          ...new Map(
+            [...prior, ...page.items].map((item) => [item.id, item]),
+          ).values(),
+        ].sort((a, b) => a.id - b.id);
+        messagesHasMore =
+          messageProjectId === projectId && prior.length > 50
+            ? messagesHasMore
+            : page.has_more;
+        messageProjectId = projectId;
+      }
+      if (historyProjectId !== projectId) {
+        historyItems = [];
+        historyOffset = 0;
+        historyHasMore = false;
+        historyProjectId = projectId;
+      }
       try {
         localStorage.setItem("deadline.current", projectId);
       } catch {}
@@ -143,9 +171,15 @@ async function run(
   }
 }
 function renderDisabled() {
+  const pendingLoss = projectId && timeLosses.load(projectId);
+  $("lose-time").textContent = pendingLoss
+    ? pendingLoss.phase === "event"
+      ? "Повторить сохранение ↗"
+      : "Повторить пересчёт ↗"
+    : "−2 часа ↗";
   document
     .querySelectorAll(
-      "#mobile-project-select,#replan,#send,#lose-time,#new-project,#mobile-new,#mobile-memory,#edit-project,#save-project,#compress,#exact-count,#create-first,#create-example,[data-accept],[data-check],[data-pin],[data-project],[data-restore],[data-retry],[data-dismiss],[data-dismiss-status]",
+      "#mobile-project-select,#replan,#send,#lose-time,#new-project,#mobile-new,#mobile-memory,#edit-project,#save-project,#compress,#exact-count,#create-first,#create-example,[data-accept],[data-check],[data-pin],[data-project],[data-restore],[data-retry],[data-dismiss],[data-dismiss-status],[data-complete-project],[data-reopen-project],[data-open-archive],#more-archive,#older-messages,[data-more-history],#logout",
     )
     .forEach((b) => {
       b.disabled = working || b.dataset.unavailable === "true";
@@ -299,6 +333,7 @@ function render() {
   renderDisabled();
 }
 function renderMessages() {
+  $("older-messages").hidden = mode === "demo" || !messagesHasMore;
   const acknowledged = new Set(messages.map((message) => message.request_id));
   outbox = outbox.filter(
     (turn) => turn.projectId !== projectId || !acknowledged.has(turn.requestId),
@@ -356,7 +391,10 @@ function renderStatus() {
   const d = board.draft,
     v = d?.validation || board.current_validation;
   let html = "";
-  if (d) {
+  if (board.project.state.completed && !d) {
+    html =
+      '<div class="status"><span>✓</span><div>Проект завершён</div><button class="quiet-button" data-reopen-project>Вернуть в работу</button></div>';
+  } else if (d) {
     const stale = board.draft_stale;
     html = `<div class="status ${stale ? "warning" : v.valid ? "draft" : "error"}"><span>⇄</span><div><strong>${stale ? "План устарел" : v.valid ? "Новый план" : "Нужно уточнить план"}</strong><br>${esc(stale ? "Пересобери план." : d.proposal.summary)}${!stale && !v.valid ? `<ul>${v.errors.map((e) => `<li>${esc(e.message)}</li>`).join("")}</ul>` : ""}</div>${!stale && v.valid ? '<button class="primary" data-accept>Принять план ✓</button>' : ""}</div>`;
   } else if (board.accepted && !v.valid) {
@@ -394,19 +432,33 @@ function planView(record) {
   if (!record)
     return '<div class="empty"><span>↗</span><p>Составь первый план.</p></div>';
   const tasks = record.proposal.tasks;
-  return `<div class="task-list">${tasks
-    .filter((t) => t.decision !== "defer")
-    .map((t) => taskRow(t, record))
-    .join("")}</div>${
-    tasks.some((t) => t.decision === "defer")
-      ? '<div class="subheading">ОТЛОЖЕНО<span></span></div><div class="task-list">' +
-        tasks
-          .filter((t) => t.decision === "defer")
-          .map((t) => taskRow(t, record))
-          .join("") +
-        "</div>"
-      : ""
-  }<details class="assumptions"><summary>Резерв: ${time(record.proposal.buffer_minutes)} · Предположения и риски</summary><ul>${[...record.proposal.assumptions, ...record.proposal.risks].map((a) => `<li>${esc(a)}</li>`).join("")}</ul></details>`;
+  const noWork = !tasks.some(
+    (t) => t.decision !== "defer" && !board.progress[t.id]?.done,
+  );
+  const completion =
+    record.id === board.accepted?.id && noWork && !board.project.state.completed
+      ? '<button class="quiet-button" data-complete-project>Подтвердить завершение проекта ✓</button>'
+      : "";
+  const archive = board.archive_count
+    ? `<button class="quiet-button" data-open-archive>Архив задач (${board.archive_count}) ↗</button>`
+    : "";
+  return (
+    completion +
+    archive +
+    `<div class="task-list">${tasks
+      .filter((t) => t.decision !== "defer")
+      .map((t) => taskRow(t, record))
+      .join("")}</div>${
+      tasks.some((t) => t.decision === "defer")
+        ? '<div class="subheading">ОТЛОЖЕНО<span></span></div><div class="task-list">' +
+          tasks
+            .filter((t) => t.decision === "defer")
+            .map((t) => taskRow(t, record))
+            .join("") +
+          "</div>"
+        : ""
+    }<details class="assumptions"><summary>Резерв: ${time(record.proposal.buffer_minutes)} · Предположения и риски</summary><ul>${[...record.proposal.assumptions, ...record.proposal.risks].map((a) => `<li>${esc(a)}</li>`).join("")}</ul></details>`
+  );
 }
 function changesView() {
   if (!board.draft)
@@ -431,7 +483,7 @@ function changesView() {
       changes
         .map((c) => {
           const t = c.after || c.before;
-          return `<article class="diff-row"><div class="diff-title"><span class="pill">${{ added: "Добавляем", changed: "Меняем", deferred: "Откладываем", removed: "Исключаем" }[c.action]}</span><button class="task-name" data-detail="${esc(t.id)}">${esc(t.title)}</button></div><div class="diff-numbers">${c.before ? time(c.before.estimate_minutes) + " → " : ""}<span>${c.after?.decision === "defer" ? "после дедлайна" : time(c.after?.estimate_minutes)}</span></div><p>${esc(t.reason)}</p>${t.tradeoff ? `<p><strong>Компромисс:</strong> ${esc(t.tradeoff)}</p>` : ""}</article>`;
+          return `<article class="diff-row"><div class="diff-title"><span class="pill">${{ added: "Добавляем", changed: "Меняем", deferred: "Откладываем", removed: "Исключаем", archived: "В архив" }[c.action]}</span><button class="task-name" data-detail="${esc(t.id)}">${esc(t.title)}</button></div><div class="diff-numbers">${c.before ? time(c.before.estimate_minutes) + " → " : ""}<span>${c.action === "archived" ? "в архив" : c.after?.decision === "defer" ? "после дедлайна" : time(c.after?.estimate_minutes)}</span></div><p>${esc(t.reason)}</p>${t.tradeoff ? `<p><strong>Компромисс:</strong> ${esc(t.tradeoff)}</p>` : ""}</article>`;
         })
         .join("") ||
     '<div class="status"><span>✓</span><div>Состав задач не изменился.</div></div>'
@@ -453,6 +505,20 @@ function eventDescription(e) {
     : "Пользователь принял предложенный маршрут.";
 }
 function historyView() {
+  if (mode !== "demo")
+    return (
+      historyItems
+        .map(
+          (item) =>
+            `<div class="history-item"><small>${esc(dateText(item.created_at))}</small><p><strong>${esc(item.title)}</strong></p><p>${esc(item.text)}</p></div>`,
+        )
+        .join("") +
+      (historyHasMore
+        ? '<button class="quiet-button" data-more-history>Показать ещё</button>'
+        : historyItems.length
+          ? ""
+          : '<p class="muted">История пуста.</p>')
+    );
   return (
     [
       ...board.plans.map((p) => ({
@@ -484,6 +550,34 @@ function historyView() {
   );
 }
 function wireRows() {
+  document
+    .querySelectorAll("[data-more-history]")
+    .forEach((button) => (button.onclick = () => loadHistory(true)));
+  document
+    .querySelectorAll("[data-complete-project],[data-reopen-project]")
+    .forEach(
+      (button) =>
+        (button.onclick = () =>
+          run(async () => {
+            const completed = button.hasAttribute("data-complete-project");
+            if (mode === "demo") {
+              demo.data.project.state.completed = completed;
+              demo.event("state_updated", { state: demo.data.project.state });
+              demo.save();
+            } else
+              await api(
+                path(""),
+                {
+                  base_revision: board.project.revision,
+                  state: { ...board.project.state, completed },
+                },
+                "PATCH",
+              );
+          }, "Сохраняю завершение проекта…")),
+    );
+  document
+    .querySelectorAll("[data-open-archive]")
+    .forEach((button) => (button.onclick = () => showArchive()));
   document.querySelectorAll("[data-project-menu]").forEach((button) => {
     button.onclick = () => openProjectMenu(button.dataset.projectMenu, button);
   });
@@ -545,7 +639,11 @@ $("mobile-project-select").onchange = (event) =>
   selectProject(event.target.value);
 function showTask(id) {
   const record = displayedPlan(board, view),
-    t = record?.proposal.tasks.find((t) => t.id === id);
+    t =
+      record?.proposal.tasks.find((t) => t.id === id) ||
+      board.diff?.find(
+        (change) => change.action === "archived" && change.task_id === id,
+      )?.before;
   if (!t) return;
   $("task-detail-title").textContent = t.title;
   const names = t.depends_on.map(
@@ -682,6 +780,7 @@ document.querySelectorAll("[data-view]").forEach(
     (b.onclick = () => {
       view = b.dataset.view;
       render();
+      if (view === "history" && mode !== "demo") loadHistory(false);
     }),
 );
 $("replan").onclick = () =>
@@ -717,21 +816,44 @@ $("chat-input").onkeydown = (e) => {
     $("chat-form").requestSubmit();
   }
 };
-$("lose-time").onclick = () =>
-  run(async () => {
-    if (mode === "demo") {
-      demo.loseTime();
-      demo.propose("Потерял два часа времени. Пересобери план.");
-    } else {
-      await api(path("/events/time-lost"), { ...op(), minutes: 120 });
-      await refresh();
-      await api(path("/plans/propose"), {
-        ...op(),
-        text: "Я потерял два часа рабочего времени. Учти новое доступное время и предложи пересобранный план с объяснением изменений.",
+$("lose-time").onclick = async () => {
+  if (working || !board) return;
+  const target = projectId;
+  try {
+    timeLosses.begin(target, 120);
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+  const completed = await run(
+    async () => {
+      await resumeTimeLoss(timeLosses, target, {
+        getRevision: async () =>
+          mode === "demo"
+            ? demo.data.project.revision
+            : (await api(`/api/projects/${target}`)).revision,
+        recordLoss: async (body) => {
+          if (mode === "demo") demo.loseTime(body.minutes, body.request_id);
+          else await api(`/api/projects/${target}/events/time-lost`, body);
+        },
+        proposePlan: async (body) => {
+          if (mode === "demo") demo.propose(body.text);
+          else await api(`/api/projects/${target}/plans/propose`, body);
+        },
       });
-    }
-    view = "changes";
-  }, "Учитываю потерю времени и запрашиваю новый план…");
+      view = "changes";
+    },
+    "Учитываю потерю времени и запрашиваю новый план…",
+    (error) => {
+      if (timeLosses.load(target)?.phase !== "event")
+        error.message = "Время уже учтено. " + error.message;
+    },
+  );
+  if (completed) {
+    timeLosses.clear(target);
+    renderDisabled();
+  }
+};
 function closeProjectMenu(restoreFocus = false) {
   $("project-menu").hidden = true;
   projectMenuAnchor?.setAttribute("aria-expanded", "false");
@@ -871,6 +993,7 @@ $("confirm-delete-project").onclick = async () => {
       outbox = outbox.filter((turn) => turn.projectId !== target.id);
       acceptedNotices.forget(target.id);
       composerDrafts.clear(target.id);
+      timeLosses.clear(target.id);
       if (projectId === target.id) {
         projectId = null;
         composerProjectId = null;
@@ -1143,6 +1266,7 @@ try {
   } else {
     if (!response.ok) throw Error("Сервер приложения недоступен");
     const runtime = await response.json();
+    $("logout").hidden = !runtime.authentication_required;
     if (runtime.service !== "deadline")
       throw Error("Неожиданный сервер приложения");
   }
@@ -1154,3 +1278,72 @@ try {
   $("connection").textContent = "Нет подключения";
   toast(error.message);
 }
+
+let archiveOffset = 0;
+async function showArchive(more = false) {
+  if (working) return;
+  return run(
+    async () => {
+      const result = await api(
+        path(`/tasks/archive?offset=${more ? archiveOffset : 0}&limit=30`),
+      );
+      const html = result.items
+        .map(
+          (item) =>
+            `<div class="memory-version"><strong>${esc(item.task.title)}</strong><p>${esc(item.task.done_when)}</p><p class="muted">${esc(dateText(item.archived_at))}</p></div>`,
+        )
+        .join("");
+      if (!more) {
+        $("archive-items").innerHTML = html;
+        archiveOffset = 0;
+      } else $("archive-items").insertAdjacentHTML("beforeend", html);
+      archiveOffset += result.items.length;
+      $("more-archive").hidden = archiveOffset >= result.total;
+      if (!$("archive-dialog").open) $("archive-dialog").showModal();
+    },
+    "Читаю архив…",
+    (error) => {
+      toast(error.message);
+    },
+  );
+}
+$("more-archive").onclick = () => showArchive(true);
+
+async function loadHistory(more = false) {
+  if (working || !board) return;
+  return run(
+    async () => {
+      const page = await api(
+        path(`/history?offset=${more ? historyOffset : 0}&limit=30`),
+      );
+      historyItems = more ? [...historyItems, ...page.items] : page.items;
+      historyOffset = page.next_offset;
+      historyHasMore = page.has_more;
+    },
+    "Читаю историю…",
+    null,
+    { quiet: true, refreshMessages: false, refreshProjects: false },
+  );
+}
+$("older-messages").onclick = () =>
+  run(
+    async () => {
+      const page = await api(
+        path(`/messages?limit=50&before_id=${messages[0].id}`),
+      );
+      messages = [...page.items, ...messages];
+      messagesHasMore = page.has_more;
+    },
+    "Читаю переписку…",
+    null,
+    { quiet: true, refreshMessages: false, refreshProjects: false },
+  );
+$("logout").onclick = async () => {
+  try {
+    const response = await fetch("/auth/logout", { method: "POST" });
+    if (!response.ok) throw Error("Logout failed");
+    location.assign("/auth/login");
+  } catch {
+    toast("Не удалось выйти. Повтори попытку.");
+  }
+};

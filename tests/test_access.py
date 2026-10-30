@@ -113,9 +113,12 @@ async def test_authentication_attempts_are_limited_and_recover_after_window(monk
     ) as api:
         for _ in range(3):
             assert (await api.get("/api/projects", auth=("owner", "wrong"))).status_code == 401
-        limited = await api.get("/api/projects", auth=("owner", "a-strong-test-password"))
+        limited = await api.get("/api/projects", auth=("owner", "wrong"))
         assert limited.status_code == 429
         assert 1 <= int(limited.headers["retry-after"]) <= 60
+        assert (
+            await api.get("/api/projects", auth=("owner", "a-strong-test-password"))
+        ).status_code == 429
         clock[0] += 61
         assert (
             await api.get("/api/projects", auth=("owner", "a-strong-test-password"))

@@ -4,7 +4,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from src import memory, plans
+from src import history, memory, plans
 from src.llm import ModelUnavailable, YandexClient
 from src.memory_schemas import ContextOperation, CreateProject, ProjectState
 from src.plan_schemas import ChangeTask, LoseTime, PlanProposal, PlanTask, ProposePlan
@@ -157,7 +157,16 @@ async def test_proposal_acceptance_and_replay_are_transactional():
     workspace = await plans.workspace(p["id"])
     assert workspace["project"]["revision"] == 2
     assert workspace["accepted"]["id"] == result["plan"]["id"]
-    assert len(workspace["events"]) == 1
+    assert (
+        len(
+            [
+                item
+                for item in (await history.page(p["id"]))["items"]
+                if item["id"].startswith("event:")
+            ]
+        )
+        == 1
+    )
 
 
 async def test_time_loss_invalidates_proposal_and_requires_replan():
@@ -189,7 +198,10 @@ async def test_explanation_only_replan_keeps_accepted_tasks_editable():
     workspace = await plans.workspace(pid)
     assert workspace["draft"] is None
     assert workspace["accepted"]["id"] == accepted_id
-    assert len(workspace["plans"]) == 2
+    assert (
+        len([item for item in (await history.page(pid))["items"] if item["id"].startswith("plan:")])
+        == 2
+    )
     assert len(await memory.list_messages(pid)) == 4
     assert (await plans.propose(pid, request, client))["replayed"]
     assert client.calls == 1
@@ -294,8 +306,9 @@ async def test_concurrent_change_discards_generated_plan():
         await plans.propose(
             p["id"], ProposePlan(**operation(0).model_dump(), text="План"), Concurrent()
         )
-    board = await plans.workspace(p["id"])
-    assert board["plans"] == []
+    assert not [
+        item for item in (await history.page(p["id"]))["items"] if item["id"].startswith("plan:")
+    ]
     assert await memory.list_messages(p["id"]) == []
 
 

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from src.memory_schemas import ContextOperation, NonEmpty, StrictModel
 
@@ -30,11 +30,31 @@ class PlanTask(StrictModel):
     reason: NonEmpty
     tradeoff: str = Field(default="", max_length=2000)
     constraint_refs: list[int] = Field(default_factory=list, max_length=50)
+    requirement_refs: list[dict] = Field(
+        default_factory=list,
+        max_length=50,
+        description="Объекты {id: string, version: integer}; у выполненной задачи версия исходная",
+    )
+
+    @field_validator("requirement_refs")
+    @classmethod
+    def valid_requirement_refs(cls, refs):
+        for ref in refs:
+            if (
+                set(ref) != {"id", "version"}
+                or not isinstance(ref["id"], str)
+                or not 1 <= len(ref["id"]) <= 36
+                or type(ref["version"]) is not int
+                or ref["version"] < 1
+            ):
+                raise ValueError("Ссылка на требование должна содержать id и положительную version")
+        return refs
 
 
 class PlanProposal(StrictModel):
     summary: NonEmpty
     tasks: list[PlanTask] = Field(default_factory=list, max_length=30)
+    archive_task_ids: list[str] = Field(default_factory=list, max_length=30)
     buffer_minutes: int = Field(ge=0, le=525600)
     assumptions: list[NonEmpty] = Field(default_factory=list, max_length=30)
     questions: list[NonEmpty] = Field(default_factory=list, max_length=20)

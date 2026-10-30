@@ -55,6 +55,7 @@
           ></select>
         </div>
         <div class="top-right">
+          <button id="logout" class="quiet-button" hidden>Выйти</button>
           <button
             class="icon-button mobile-tool"
             id="mobile-new"
@@ -164,6 +165,9 @@
               <button id="animation-prompt">Анимации важны для показа ↗</button
               ><button id="why-prompt">Что можно отложить? ↗</button>
             </div>
+            <button id="older-messages" class="quiet-button" hidden>
+              Предыдущие сообщения
+            </button>
             <div id="messages" aria-live="polite"></div>
           </div>
           <div class="chat-bottom">
@@ -399,6 +403,23 @@
           Удалить проект
         </button>
       </div>
+    </dialog>
+    <dialog id="archive-dialog" aria-labelledby="archive-title">
+      <div class="dialog-header">
+        <h2 id="archive-title">Архив задач</h2>
+        <button
+          type="button"
+          class="icon-button"
+          data-close="archive-dialog"
+          aria-label="Закрыть"
+        >
+          ×
+        </button>
+      </div>
+      <div id="archive-items"></div>
+      <button id="more-archive" class="quiet-button" hidden>
+        Показать ещё
+      </button>
     </dialog>
     <div id="toast" class="toast" role="status"></div>
     <script type="module" src="deadline.js"></script>

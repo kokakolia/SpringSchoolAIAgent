@@ -37,6 +37,7 @@ async def runtime():
         "service": "deadline",
         "mode": "live",
         "model_configured": bool(settings.yandex_api_key and settings.yandex_folder_id),
+        "authentication_required": bool(settings.app_password.get_secret_value()),
     }
 
 

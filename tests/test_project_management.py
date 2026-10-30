@@ -4,7 +4,7 @@ import httpx
 import pytest
 from sqlalchemy import func, select
 
-from src import database, memory, plans
+from src import database, history, memory, plans
 from src.llm import YandexClient
 from src.memory_models import ContextVersion, Message, PlanVersion, ProjectEvent, TaskProgress
 from src.memory_schemas import (
@@ -126,7 +126,7 @@ async def test_rename_preserves_state_and_does_not_invalidate_pending_plan():
     workspace = await plans.workspace(p["id"])
     assert not workspace["draft_stale"]
     assert workspace["draft"]["base_revision"] == 2
-    assert workspace["events"][0]["kind"] == "project_renamed"
+    assert (await history.page(p["id"]))["items"][0]["title"] == "Проект переименован"
     await plans.accept(p["id"], draft["plan"]["id"], operation(4))
     with pytest.raises(memory.MemoryError) as error:
         await memory.update_project(p["id"], UpdateProject(base_revision=3, title="Stale"))

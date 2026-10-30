@@ -17,6 +17,7 @@ def no_external_http(monkeypatch):
 
     auth_throttle.clear()
     monkeypatch.setattr(settings, "app_password", SecretStr(""))
+    monkeypatch.setattr(settings, "app_username", "owner")
     monkeypatch.setattr(settings, "app_allow_http", False)
     original_client = httpx.AsyncClient
 

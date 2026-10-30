@@ -2,10 +2,10 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.routing import APIRoute
 
-from src import memory, plans
+from src import history, memory, plans
 from src.llm import ModelUnavailable, YandexClient
 from src.memory_schemas import (
     ContextOperation,
@@ -64,8 +64,12 @@ async def remove(project_id: UUID, body: DeleteProject):
 
 
 @router.get("/{project_id}/messages")
-async def messages(project_id: UUID):
-    return await memory.list_messages(str(project_id))
+async def messages(
+    project_id: UUID,
+    limit: int = Query(50, ge=1, le=100),
+    before_id: int | None = Query(None, ge=1),
+):
+    return await memory.message_page(str(project_id), limit, before_id)
 
 
 @router.post("/{project_id}/messages")
@@ -125,3 +129,22 @@ async def time_lost(project_id: UUID, body: LoseTime):
 @router.patch("/{project_id}/tasks/{task_id}")
 async def task_progress(project_id: UUID, task_id: str, body: ChangeTask):
     return await plans.change_task(str(project_id), task_id, body)
+
+
+@router.get("/{project_id}/tasks/archive")
+async def task_archive(
+    project_id: UUID, offset: int = Query(0, ge=0), limit: int = Query(30, ge=1, le=100)
+):
+    return await plans.task_archive(str(project_id), offset, limit)
+
+
+@router.get("/{project_id}/history")
+async def project_history(
+    project_id: UUID, offset: int = Query(0, ge=0), limit: int = Query(30, ge=1, le=100)
+):
+    return await history.page(str(project_id), offset, limit)
+
+
+@router.get("/{project_id}/plans/{plan_id}")
+async def plan_detail(project_id: UUID, plan_id: UUID):
+    return await history.plan(str(project_id), str(plan_id))

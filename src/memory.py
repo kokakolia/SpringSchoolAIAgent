@@ -7,25 +7,32 @@ the final commit from overwriting user edits or another model response.
 import json
 import math
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import LargeBinary, cast, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import database
 from src.config import settings
 from src.llm import YandexClient
 from src.memory_models import (
+    ArchivedTask,
     ContextVersion,
     Message,
     ModelOperation,
+    OperationRecord,
     PlanVersion,
     Project,
     ProjectEvent,
+    RequirementProof,
+    TaskDependency,
     TaskProgress,
     iso_utc,
     new_id,
 )
 from src.memory_schemas import CreateProject, MemorySummary, SendMessage, UpdateProject
 from src.model_operations import serialized_model_operation
+from src.operations import register
+from src.requirements import reconcile
+from src.time_budget import change_budget
 
 AGENT_PROMPT = """Ты — агент «До дедлайна». Помоги довести проект до проверяемого результата.
 Уточняй цель, критерии успеха, дедлайн и доступное рабочее время. При недостатке
@@ -69,8 +76,22 @@ def project_dict(project: Project) -> dict:
         "id": project.id,
         "title": project.title,
         "state": project.state,
+        "requirements": project.requirements,
         "revision": project.revision,
         "current_context_id": project.current_context_id,
+        "time_budget": {
+            "allocated_minutes": project.time_budget_minutes,
+            "lost_minutes": project.time_lost_minutes,
+            "charged_minutes": project.time_spent_minutes,
+            "overrun_minutes": max(
+                0,
+                project.time_lost_minutes
+                + project.time_spent_minutes
+                - project.time_budget_minutes,
+            )
+            if project.time_budget_minutes is not None
+            else 0,
+        },
     }
 
 
@@ -143,7 +164,16 @@ def assemble(state: dict, summary: dict | None, dialogue: list[dict]) -> list[di
 
 async def load_context(session, project: Project, version: ContextVersion | None = None):
     if version is None and project.current_context_id:
-        version = await require_version(session, project.id, project.current_context_id)
+        version = (
+            await session.execute(
+                select(ContextVersion.summary, ContextVersion.covered_message_id).where(
+                    ContextVersion.id == project.current_context_id,
+                    ContextVersion.project_id == project.id,
+                )
+            )
+        ).first()
+        if version is None:
+            raise MemoryError("Версия контекста не найдена", 404)
     cutoff = version.covered_message_id if version else 0
     rows = (
         await session.scalars(
@@ -160,7 +190,12 @@ async def load_context(session, project: Project, version: ContextVersion | None
 
 async def create_project(body: CreateProject):
     async with database._get_session_maker()() as session:
-        project = Project(title=body.title, state=body.state.model_dump(mode="json"))
+        project = Project(
+            title=body.title,
+            state=body.state.model_dump(mode="json"),
+            time_budget_minutes=body.state.available_minutes,
+            requirements=reconcile([], body.state.constraints),
+        )
         session.add(project)
         await session.commit()
         return project_dict(project)
@@ -182,6 +217,21 @@ async def update_project(project_id: str, body: UpdateProject):
         project = await require_project(session, project_id)
         check_revision(project, body.base_revision)
         state = body.state.model_dump(mode="json") if body.state is not None else project.state
+        budget_values = {}
+        if body.state is not None and state.get("constraints", []) != project.state.get(
+            "constraints", []
+        ):
+            budget_values["requirements"] = reconcile(project.requirements, state["constraints"])
+        if body.state is not None:
+            if state.get("available_minutes") != project.state.get("available_minutes"):
+                ledger = change_budget(project, remaining=state["available_minutes"])
+                ledger.pop("state")
+                budget_values.update(ledger)
+            if any(
+                state.get(key) != project.state.get(key)
+                for key in ("goal", "success_criteria", "constraints")
+            ):
+                state["completed"] = False
         title = body.title if body.title is not None else project.title
         state_changed = state != project.state
         if not state_changed and title == project.title:
@@ -193,6 +243,7 @@ async def update_project(project_id: str, body: UpdateProject):
             body.base_revision,
             state=state,
             title=title,
+            **budget_values,
         )
         session.add(
             ProjectEvent(
@@ -216,6 +267,10 @@ async def delete_project(project_id: str, revision: int):
         # Lock this revision before removing children. Concurrent model replies fail CAS.
         await advance(session, project_id, revision)
         for model in (
+            ArchivedTask,
+            OperationRecord,
+            RequirementProof,
+            TaskDependency,
             ModelOperation,
             Message,
             ContextVersion,
@@ -270,6 +325,7 @@ async def send_message(project_id: str, body: SendMessage, client: YandexClient)
 
     if body.text == "/compress":
         return await _compress_context(project_id, str(body.request_id), body.base_revision, client)
+    await register(project_id, body.request_id, "message_send", {"text": body.text})
     async with database._get_session_maker()() as session:
         project = await require_project(session, project_id)
         previous = (
@@ -313,6 +369,7 @@ async def send_message(project_id: str, body: SendMessage, client: YandexClient)
 
 
 async def _compress_context(project_id: str, request_id: str, revision: int, client: YandexClient):
+    await register(project_id, request_id, "context_compress", {})
     async with database._get_session_maker()() as session:
         project = await require_project(session, project_id)
         existing = await session.scalar(
@@ -392,6 +449,7 @@ async def get_version(project_id: str, version_id: str):
 
 
 async def restore_context(project_id: str, version_id: str, request_id: str, revision: int):
+    await register(project_id, request_id, "context_restore", {"version_id": version_id})
     async with database._get_session_maker()() as session:
         project = await require_project(session, project_id)
         source = await require_version(session, project_id, version_id)
@@ -427,3 +485,68 @@ async def restore_context(project_id: str, version_id: str, request_id: str, rev
         session.add(restored)
         await session.commit()
         return {"context": version_dict(restored), "revision": revision + 1, "replayed": False}
+
+
+async def context_metrics(session, project):
+    version = (
+        (
+            await session.execute(
+                select(ContextVersion.summary, ContextVersion.covered_message_id).where(
+                    ContextVersion.id == project.current_context_id,
+                    ContextVersion.project_id == project.id,
+                )
+            )
+        ).first()
+        if project.current_context_id
+        else None
+    )
+    cutoff = version.covered_message_id if version else 0
+    size = (
+        func.octet_length(Message.text)
+        if session.bind.dialect.name == "postgresql"
+        else func.length(cast(Message.text, LargeBinary))
+    )
+    total, count = (
+        await session.execute(
+            select(func.coalesce(func.sum(size), 0), func.count()).where(
+                Message.project_id == project.id, Message.id > cutoff
+            )
+        )
+    ).one()
+    base = assemble(project.state, version.summary if version else None, [])
+    estimated = estimate_tokens(base) + math.ceil((total + 40 * count) / 3)
+    result = metrics(base)
+    result.update(
+        input_tokens=estimated,
+        budget_fraction=round(
+            (estimated + settings.response_reserve_tokens) / settings.context_budget_tokens, 4
+        ),
+        compression_recommended=estimated + settings.response_reserve_tokens
+        >= settings.context_budget_tokens * settings.context_compression_threshold,
+    )
+    return result
+
+
+async def message_page(project_id, limit=50, before_id=None):
+    async with database._get_session_maker()() as session:
+        await require_project(session, project_id)
+        query = select(Message).where(Message.project_id == project_id)
+        if before_id is not None:
+            query = query.where(Message.id < before_id)
+        rows = (await session.scalars(query.order_by(Message.id.desc()).limit(limit + 1))).all()
+        more = len(rows) > limit
+        rows = list(reversed(rows[:limit]))
+        return {
+            "items": [
+                {
+                    "id": row.id,
+                    "role": row.role,
+                    "text": row.text,
+                    "request_id": row.request_id,
+                    "usage": row.usage,
+                }
+                for row in rows
+            ],
+            "has_more": more,
+            "before_id": rows[0].id if rows else None,
+        }

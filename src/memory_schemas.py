@@ -14,6 +14,7 @@ class StrictModel(BaseModel):
 
 class ProjectState(StrictModel):
     goal: NonEmpty
+    completed: bool = False
     success_criteria: list[NonEmpty] = Field(default_factory=list, max_length=50)
     constraints: list[NonEmpty] = Field(default_factory=list, max_length=50)
     available_minutes: int | None = Field(default=None, ge=0, le=525600)

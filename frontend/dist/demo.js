@@ -5,6 +5,7 @@ const copy = (value) => structuredClone(value);
 export function exampleState() {
   return {
     goal: "Показать работающий AI-проект на защите",
+    completed: false,
     success_criteria: [
       "Пользователь проходит основной сценарий от ввода до сохранённого результата",
     ],
@@ -110,11 +111,18 @@ function validate(proposal, state, progress) {
       (t) => t.decision !== "defer" && !progress[t.id]?.done,
     ),
     work = tasks.reduce((s, t) => s + t.estimate_minutes, 0),
-    required = work + proposal.buffer_minutes;
+    required = work + (state.completed ? 0 : proposal.buffer_minutes);
+  const missingWork = !tasks.length && !state.completed;
   return {
-    valid: required <= state.available_minutes,
-    errors:
-      required > state.available_minutes
+    valid: !missingWork && required <= state.available_minutes,
+    errors: missingWork
+      ? [
+          {
+            message:
+              "Подтверди завершение проекта или добавь работу для достижения цели.",
+          },
+        ]
+      : required > state.available_minutes
         ? [
             {
               message: `План требует ${required} мин., доступно ${state.available_minutes} мин.`,
@@ -184,6 +192,22 @@ export class Demo {
         : message,
     );
     if (!this.data.plans.length) this.data.plans = [copy(this.data.accepted)];
+    if (!this.data.timeBudget) {
+      const charged = Object.values(this.data.progress).reduce(
+        (sum, flags) =>
+          sum +
+          (flags.done ? (flags.debited_minutes ?? flags.spent_minutes) : 0),
+        0,
+      );
+      const lost = this.data.events
+        .filter((e) => e.kind === "time_lost")
+        .reduce((sum, e) => sum + e.payload.minutes, 0);
+      this.data.timeBudget = {
+        allocated: this.data.project.state.available_minutes + lost + charged,
+        lost,
+        charged,
+      };
+    }
   }
   save() {
     try {
@@ -230,25 +254,34 @@ export class Demo {
     }
     return d;
   }
-  event(kind, payload) {
+  event(kind, payload, requestId = crypto.randomUUID()) {
     this.data.project.revision++;
     this.data.events.unshift({
       id: crypto.randomUUID(),
+      request_id: requestId,
       kind,
       payload,
       revision: this.data.project.revision,
       created_at: new Date().toISOString(),
     });
   }
-  loseTime() {
+  updateBudget() {
+    const budget = this.data.timeBudget;
     this.data.project.state.available_minutes = Math.max(
       0,
-      this.data.project.state.available_minutes - 120,
+      budget.allocated - budget.lost - budget.charged,
     );
-    this.event("time_lost", {
-      minutes: 120,
-      remaining_minutes: this.data.project.state.available_minutes,
-    });
+  }
+  loseTime(minutes = 120, requestId = crypto.randomUUID()) {
+    if (this.data.events.some((event) => event.request_id === requestId))
+      return;
+    this.data.timeBudget.lost += minutes;
+    this.updateBudget();
+    this.event(
+      "time_lost",
+      { minutes, remaining_minutes: this.data.project.state.available_minutes },
+      requestId,
+    );
     this.save();
   }
   propose(text) {
@@ -337,11 +370,9 @@ export class Demo {
       if (!t.depends_on.every((dep) => d.progress[dep]?.done))
         throw Error("Сначала заверши задачи, от которых зависит эта");
       flags.spent_minutes = patch.actual_minutes ?? t.estimate_minutes;
-      flags.debited_minutes = Math.min(
-        d.project.state.available_minutes,
-        flags.spent_minutes,
-      );
-      d.project.state.available_minutes -= flags.debited_minutes;
+      flags.debited_minutes = flags.spent_minutes;
+      d.timeBudget.charged += flags.debited_minutes;
+      this.updateBudget();
     }
     if (patch.done === false && flags.done) {
       if (
@@ -350,8 +381,8 @@ export class Demo {
         )
       )
         throw Error("Сначала верни зависимые задачи");
-      d.project.state.available_minutes +=
-        flags.debited_minutes ?? flags.spent_minutes;
+      d.timeBudget.charged -= flags.debited_minutes ?? flags.spent_minutes;
+      this.updateBudget();
       flags.spent_minutes = 0;
       flags.debited_minutes = 0;
     }
@@ -377,6 +408,11 @@ export class Demo {
   restoreExample() {
     this.data = seed();
     this.data.plans = [copy(this.data.accepted)];
+    this.data.timeBudget = {
+      allocated: this.data.project.state.available_minutes,
+      lost: 0,
+      charged: 0,
+    };
     this.save();
   }
 }

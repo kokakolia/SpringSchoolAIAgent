@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 
 from src.plan_schemas import PlanProposal, WorkWindow
+from src.requirements import bind, fallback, key
 
 
 def validate_plan(
@@ -12,8 +13,15 @@ def validate_plan(
     previous: dict | None = None,
     *,
     now: datetime | None = None,
+    requirements: list | None = None,
+    confirmed: list | None = None,
+    broken_dependencies: bool = False,
 ) -> dict:
     now = now or datetime.now(timezone.utc)
+    requirements = (
+        requirements if requirements is not None else fallback(state.get("constraints", []))
+    )
+    proposal = bind(proposal.model_copy(deep=True), requirements, progress)
     errors = []
 
     def error(code, message, task_id=None):
@@ -22,7 +30,8 @@ def validate_plan(
     tasks = {t.id: t for t in proposal.tasks}
     if len(tasks) != len(proposal.tasks):
         error("duplicate_id", "У задач должны быть уникальные идентификаторы")
-    if not tasks:
+    completed = state.get("completed", False)
+    if not tasks and not completed:
         error("empty_plan", "В предложении пока нет задач")
     if proposal.questions:
         error("questions", "Нужно уточнить: " + "; ".join(proposal.questions))
@@ -35,7 +44,7 @@ def validate_plan(
     deadline = datetime.fromisoformat(state["deadline"]) if state.get("deadline") else None
     if deadline is None:
         error("deadline_unknown", "Укажите дедлайн проекта")
-    if deadline:
+    if deadline and not completed:
         capacity = min(capacity, max(0, int((deadline - now).total_seconds() // 60)))
         if deadline <= now:
             error("deadline_passed", "Дедлайн уже прошёл: задайте новый срок")
@@ -52,27 +61,82 @@ def validate_plan(
         )
     done = {key for key, value in progress.items() if value.get("done")}
     active = {t.id: t for t in proposal.tasks if t.decision != "defer" and t.id not in done}
+    if not active and not completed:
+        error(
+            "no_active_work",
+            "Нет работы для достижения цели. Подтвердите завершение проекта или пересоберите план",
+        )
+    if active and completed:
+        error("completed_project", "Проект завершён. Верните его в работу перед добавлением задач")
+    old_tasks = {task["id"]: task for task in (previous or {}).get("tasks", [])}
+    archive = set(proposal.archive_task_ids)
+    if len(archive) != len(proposal.archive_task_ids):
+        error("duplicate_archive", "Задача указана в архиве несколько раз")
+    for task_id in archive:
+        old = old_tasks.get(task_id)
+        flags = progress.get(task_id, {})
+        if (
+            old is None
+            or task_id in tasks
+            or flags.get("pinned")
+            or (not flags.get("done") and old["decision"] != "defer")
+        ):
+            error(
+                "bad_archive",
+                "В архив можно убрать только завершённую или уже отложенную незакреплённую задачу",
+                task_id,
+            )
     for task in proposal.tasks:
+        if progress.get(task.id, {}).get("archived"):
+            error(
+                "archived_id", "Идентификатор архивной задачи нельзя использовать повторно", task.id
+            )
         if task.decision in ("simplify", "defer") and not task.tradeoff:
             error("tradeoff_missing", "Нужно объяснить последствия изменения", task.id)
         if len(set(task.depends_on)) != len(task.depends_on):
             error("duplicate_dependency", "Зависимость указана несколько раз", task.id)
         for dependency in task.depends_on:
-            if dependency == task.id or dependency not in tasks:
+            if dependency == task.id or (dependency not in tasks and dependency not in done):
                 error("bad_dependency", "Неизвестная зависимость или ссылка на себя", task.id)
             elif task.id in active and dependency not in active and dependency not in done:
                 error("deferred_dependency", "Активная задача зависит от отложенной", task.id)
-        if any(ref < 1 or ref > len(state.get("constraints", [])) for ref in task.constraint_refs):
+        if not progress.get(task.id, {}).get("done") and any(
+            ref < 1 or ref > len(state.get("constraints", [])) for ref in task.constraint_refs
+        ):
             error("bad_constraint", "Ссылка на несуществующее требование", task.id)
-    covered = {ref for t in proposal.tasks if t.decision != "defer" for ref in t.constraint_refs}
-    for index, constraint in enumerate(state.get("constraints", []), 1):
-        if index not in covered:
-            error("uncovered_constraint", f"В плане не отражено требование: {constraint}")
+    required_keys = {key(item) for item in requirements}
+    covered = {key(item) for item in (confirmed or [])}
+    for task in proposal.tasks:
+        refs = task.requirement_refs
+        flags = progress.get(task.id, {})
+        if flags.get("done"):
+            original = flags.get("completed_requirements", refs)
+            if {key(ref) for ref in refs} != {key(ref) for ref in original}:
+                error(
+                    "completed_requirements",
+                    "Нельзя менять подтверждённые требования выполненной задачи",
+                    task.id,
+                )
+            refs = original
+        elif any(key(ref) not in required_keys for ref in refs):
+            error("bad_requirement", "Ссылка на неактуальную версию требования", task.id)
+        if task.decision != "defer":
+            covered.update(key(ref) for ref in refs)
+    for requirement in requirements:
+        if key(requirement) not in covered:
+            error("uncovered_constraint", "В плане не отражено требование: " + requirement["text"])
+    if broken_dependencies:
+        error("completed_dependency", "Нарушены зависимости выполненных задач, включая архив")
     for old in (previous or {}).get("tasks", []):
         protected = tasks.get(old["id"])
         flags = progress.get(old["id"], {})
         if protected is None:
-            error("silent_removal", "Покажите исключение старой задачи явно", old["id"])
+            if old["id"] not in archive:
+                error(
+                    "silent_removal",
+                    "Покажите исключение старой задачи явно или предложите архивирование",
+                    old["id"],
+                )
         elif flags.get("done") or flags.get("pinned"):
             if (
                 protected.title != old["title"]
@@ -115,7 +179,7 @@ def validate_plan(
         satisfied.add(task.id)
         remaining.pop(task.id)
     effort = sum(t.estimate_minutes for t in active.values())
-    required = effort + proposal.buffer_minutes
+    required = effort + (0 if completed else proposal.buffer_minutes)
     if required > capacity:
         error("over_capacity", f"План требует {required} мин., доступно {capacity} мин.")
     schedule = []
@@ -168,11 +232,13 @@ def same_plan(previous: dict | None, proposal: dict) -> bool:
     def signature(plan):
         return (
             plan.get("buffer_minutes", 0),
+            tuple(sorted(plan.get("archive_task_ids", []))),
             [
                 (
                     *(task.get(key) for key in fields),
                     tuple(sorted(task.get("depends_on", []))),
                     tuple(sorted(task.get("constraint_refs", []))),
+                    tuple(sorted(key(ref) for ref in task.get("requirement_refs", []))),
                 )
                 for task in plan["tasks"]
             ],
@@ -192,6 +258,7 @@ def plan_diff(previous: dict | None, proposal: dict) -> list[dict]:
         "depends_on",
         "done_when",
         "constraint_refs",
+        "requirement_refs",
     )
     for task in proposal["tasks"]:
         before = old.pop(task["id"], None)
@@ -202,6 +269,12 @@ def plan_diff(previous: dict | None, proposal: dict) -> list[dict]:
             action = "deferred"
         changes.append({"task_id": task["id"], "action": action, "before": before, "after": task})
     changes.extend(
-        {"task_id": t["id"], "action": "removed", "before": t, "after": None} for t in old.values()
+        {
+            "task_id": t["id"],
+            "action": "archived" if t["id"] in proposal.get("archive_task_ids", []) else "removed",
+            "before": t,
+            "after": None,
+        }
+        for t in old.values()
     )
     return changes

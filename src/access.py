@@ -7,12 +7,20 @@ import math
 import secrets
 import time
 from collections import OrderedDict
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, RedirectResponse
 
 from src.config import settings
+from src.sessions import (
+    cookie_name,
+    issue_session,
+    login_page,
+    revoke_session,
+    session_headers,
+    valid_session,
+)
 
 
 class AuthThrottle:
@@ -79,6 +87,14 @@ def origin_key(value):
         return None
 
 
+def verify_password(username, supplied):
+    valid_user = secrets.compare_digest(username.encode(), settings.app_username.encode())
+    valid_password = secrets.compare_digest(
+        supplied.encode(), settings.app_password.get_secret_value().encode()
+    )
+    return valid_user and valid_password
+
+
 class AccessMiddleware:
     def __init__(self, app):
         self.app = app
@@ -87,6 +103,7 @@ class AccessMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         request = Request(scope)
+        new_session = None
 
         async def safe_send(message):
             if message["type"] == "http.response.start":
@@ -98,6 +115,8 @@ class AccessMiddleware:
                         (b"x-content-type-options", b"nosniff"),
                     ]
                 )
+                if new_session is not None:
+                    headers.extend(session_headers(request, new_session))
                 if request.url.path.startswith("/api/"):
                     headers.append((b"cache-control", b"no-store"))
                 message = {**message, "headers": headers}
@@ -126,38 +145,107 @@ class AccessMiddleware:
                     {"detail": "Для внешнего доступа требуется HTTPS"}, status_code=403
                 )
             else:
-                peer = request.client.host if request.client else "unknown"
-                retry_after = auth_throttle.retry_after(peer)
-                if retry_after:
-                    return await JSONResponse(
-                        {"detail": "Слишком много попыток входа. Попробуйте через минуту"},
-                        status_code=429,
-                        headers={"Retry-After": str(retry_after)},
-                    )(scope, receive, safe_send)
-                username, supplied = "", ""
-                header = request.headers.get("authorization", "")
-                if header.lower().startswith("basic "):
-                    try:
-                        username, supplied = (
-                            base64.b64decode(header[6:], validate=True)
-                            .decode("utf-8")
-                            .split(":", 1)
-                        )
-                    except (binascii.Error, UnicodeDecodeError, ValueError):
-                        pass
-                valid_user = secrets.compare_digest(
-                    username.encode(), settings.app_username.encode()
-                )
-                valid_password = secrets.compare_digest(supplied.encode(), password.encode())
-                if not (valid_user and valid_password):
-                    auth_throttle.failed(peer)
-                    error = JSONResponse(
-                        {"detail": "Требуется вход"},
-                        status_code=401,
-                        headers={"WWW-Authenticate": 'Basic realm="Deadline", charset="UTF-8"'},
+                token = request.cookies.get(cookie_name(request))
+                authenticated = await valid_session(token)
+                if request.url.path == "/auth/logout" and request.method == "POST":
+                    if authenticated:
+                        await revoke_session(token)
+                    response = RedirectResponse("/auth/login", status_code=303)
+                    response.delete_cookie(
+                        cookie_name(request),
+                        path="/",
+                        secure=request.url.scheme == "https",
+                        httponly=True,
+                        samesite="strict",
                     )
+                    return await response(scope, receive, safe_send)
+                if authenticated:
+                    if request.url.path == "/auth/login":
+                        return await RedirectResponse("/", status_code=303)(
+                            scope, receive, safe_send
+                        )
                 else:
-                    auth_throttle.succeeded(peer)
+                    if request.url.path == "/auth/login" and request.method == "GET":
+                        return await login_page()(scope, receive, safe_send)
+                    header = request.headers.get("authorization", "")
+                    form_login = request.url.path == "/auth/login" and request.method == "POST"
+                    if not header and not form_login:
+                        response = (
+                            JSONResponse(
+                                {"detail": "Требуется вход"},
+                                status_code=401,
+                                headers={
+                                    "WWW-Authenticate": 'Basic realm="Deadline", charset="UTF-8"'
+                                },
+                            )
+                            if request.url.path.startswith("/api/")
+                            else RedirectResponse("/auth/login", status_code=303)
+                        )
+                        return await response(scope, receive, safe_send)
+                    peer = request.client.host if request.client else "unknown"
+                    retry_after = auth_throttle.retry_after(peer)
+                    if retry_after:
+                        response = (
+                            login_page("Слишком много попыток входа. Повторите через минуту", 429)
+                            if form_login
+                            else JSONResponse(
+                                {"detail": "Слишком много попыток входа"}, status_code=429
+                            )
+                        )
+                        response.headers["Retry-After"] = str(retry_after)
+                        return await response(scope, receive, safe_send)
+                    # Reserve an attempt before parsing or comparing the password.
+                    auth_throttle.failed(peer)
+                    username, supplied = "", ""
+                    if form_login:
+                        raw = bytearray()
+                        while True:
+                            message = await receive()
+                            if message["type"] == "http.disconnect":
+                                return
+                            raw.extend(message.get("body", b""))
+                            if len(raw) > 4096:
+                                return await JSONResponse(
+                                    {"detail": "Слишком большой запрос входа"}, status_code=413
+                                )(scope, receive, safe_send)
+                            if not message.get("more_body", False):
+                                break
+                        try:
+                            values = parse_qs(raw.decode("utf-8"), max_num_fields=4)
+                            username, supplied = (
+                                values.get("username", [""])[0],
+                                values.get("password", [""])[0],
+                            )
+                        except (UnicodeDecodeError, ValueError):
+                            pass
+                    elif header.lower().startswith("basic ") and len(header) <= 4096:
+                        try:
+                            username, supplied = (
+                                base64.b64decode(header[6:], validate=True)
+                                .decode("utf-8")
+                                .split(":", 1)
+                            )
+                        except (binascii.Error, UnicodeDecodeError, ValueError):
+                            pass
+                    if verify_password(username, supplied):
+                        auth_throttle.succeeded(peer)
+                        new_session = await issue_session()
+                        if form_login:
+                            return await RedirectResponse("/", status_code=303)(
+                                scope, receive, safe_send
+                            )
+                    else:
+                        error = (
+                            login_page("Неверное имя пользователя или пароль", 401)
+                            if form_login
+                            else JSONResponse(
+                                {"detail": "Требуется вход"},
+                                status_code=401,
+                                headers={
+                                    "WWW-Authenticate": 'Basic realm="Deadline", charset="UTF-8"'
+                                },
+                            )
+                        )
         if error is not None:
             return await error(scope, receive, safe_send)
         if scope["method"] in {"POST", "PUT", "PATCH", "DELETE"}:

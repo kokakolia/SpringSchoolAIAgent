@@ -3,6 +3,7 @@ export function samePlan(previous, proposal) {
   if (!previous || !proposal) return false;
   const signature = (plan) => [
     plan.buffer_minutes ?? 0,
+    [...(plan.archive_task_ids || [])].sort(),
     plan.tasks.map((task) => [
       ...[
         "id",
@@ -14,6 +15,9 @@ export function samePlan(previous, proposal) {
       ].map((key) => task[key] ?? null),
       [...(task.depends_on || [])].sort(),
       [...(task.constraint_refs || [])].sort((a, b) => a - b),
+      (task.requirement_refs || [])
+        .map((ref) => `${ref.id}:${ref.version}`)
+        .sort(),
     ]),
   ];
   return (

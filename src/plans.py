@@ -3,18 +3,40 @@
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 
 from src import database, memory
 from src.context_budget import ContextGuard
 from src.llm import ModelUnavailable, YandexClient
-from src.memory_models import Message, PlanVersion, ProjectEvent, TaskProgress, iso_utc
+from src.memory_models import (
+    ArchivedTask,
+    Message,
+    PlanVersion,
+    ProjectEvent,
+    RequirementProof,
+    TaskProgress,
+    iso_utc,
+)
 from src.model_operations import serialized_model_operation
+from src.operations import register
 from src.plan_schemas import ChangeTask, LoseTime, PlanProposal, ProposePlan
 from src.planner import plan_diff, same_plan, validate_plan
+from src.requirements import bind, key
+from src.task_integrity import (
+    broken_completed_dependencies,
+    completed_dependents,
+    confirmed_requirements,
+    progress_map,
+    replace_dependencies,
+    task_ids,
+    unfinished_ancestors,
+)
+from src.time_budget import change_budget
 
 
-async def generate_checked(client, messages, state, flags, baseline, guard=None):
+async def generate_checked(
+    client, messages, state, flags, baseline, guard=None, checker=None, requirements=None
+):
     checks, usages = [], []
     proposal = None
     validation = None
@@ -34,7 +56,13 @@ async def generate_checked(client, messages, state, flags, baseline, guard=None)
         usages.append(usage)
         try:
             proposal = PlanProposal.model_validate_json(text)
-            validation = validate_plan(proposal, state, flags, baseline)
+            if requirements is not None:
+                bind(proposal, requirements, flags)
+            validation = (
+                await checker(proposal)
+                if checker
+                else validate_plan(proposal, state, flags, baseline)
+            )
             errors = validation["errors"]
         except ValueError as error:
             proposal = None
@@ -113,22 +141,14 @@ def proposal_is_current(row, project, events):
     )
 
 
-async def progress_map(session, project_id):
-    rows = (
-        await session.scalars(select(TaskProgress).where(TaskProgress.project_id == project_id))
-    ).all()
-    return {
-        row.task_id: {"done": row.done, "pinned": row.pinned, "spent_minutes": row.spent_minutes}
-        for row in rows
-    }
-
-
 def plan_dict(row):
     if row is None:
         return None
     return {
         "id": row.id,
-        "proposal": row.proposal,
+        "proposal": {**row.proposal, "archive_task_ids": []}
+        if row.accepted_revision is not None
+        else row.proposal,
         "validation": row.validation,
         "base_revision": row.base_revision,
         "accepted_revision": row.accepted_revision,
@@ -136,67 +156,101 @@ def plan_dict(row):
     }
 
 
+async def proposal_current(session, row, project):
+    delta = project.revision - row.base_revision - 1
+    if delta < 0:
+        return False
+    if delta == 0:
+        return True
+    query = select(
+        func.count(func.distinct(ProjectEvent.revision)),
+        func.count().filter(ProjectEvent.kind != "project_renamed"),
+    ).where(
+        ProjectEvent.project_id == project.id,
+        ProjectEvent.revision > row.base_revision + 1,
+        ProjectEvent.revision <= project.revision,
+    )
+    count, other = (await session.execute(query)).one()
+    return count == delta and other == 0
+
+
+async def checked(session, project, proposal, baseline):
+    flags = await progress_map(session, project.id, task_ids(proposal.model_dump(), baseline))
+    return validate_plan(
+        proposal,
+        project.state,
+        flags,
+        baseline,
+        requirements=project.requirements,
+        confirmed=await confirmed_requirements(session, project.id, project.requirements),
+        broken_dependencies=await broken_completed_dependencies(session, project.id),
+    )
+
+
 async def workspace(project_id):
     async with database._get_session_maker()() as session:
         project = await memory.require_project(session, project_id)
-        rows = (
-            await session.scalars(
-                select(PlanVersion)
-                .where(PlanVersion.project_id == project_id)
-                .order_by(PlanVersion.created_at.desc())
-            )
-        ).all()
         head = await head_plan(session, project_id)
-        draft = rows[0] if rows and rows[0].accepted_revision is None else None
+        latest = await session.scalar(
+            select(PlanVersion)
+            .where(PlanVersion.project_id == project_id)
+            .order_by(PlanVersion.created_at.desc(), PlanVersion.id.desc())
+            .limit(1)
+        )
+        draft = latest if latest and latest.accepted_revision is None else None
         if (
             draft
             and head
             and draft.validation["valid"]
-            and same_plan(head.proposal, draft.proposal)
+            and same_plan(plan_dict(head)["proposal"], draft.proposal)
         ):
             draft = None
-        flags = await progress_map(session, project_id)
-        events = (
-            await session.scalars(
-                select(ProjectEvent)
-                .where(ProjectEvent.project_id == project_id)
-                .order_by(ProjectEvent.revision.desc())
-            )
-        ).all()
-        messages, _, _, _ = await memory.load_context(session, project)
-        current_validation = (
-            validate_plan(
-                PlanProposal.model_validate(head.proposal), project.state, flags, head.proposal
+        accepted = plan_dict(head)
+        ids = task_ids(
+            accepted["proposal"] if accepted else None, draft.proposal if draft else None
+        )
+        flags = await progress_map(session, project_id, ids)
+        validation = (
+            await checked(
+                session,
+                project,
+                PlanProposal.model_validate(accepted["proposal"]),
+                accepted["proposal"],
             )
             if head
             else None
         )
+        archive_count = await session.scalar(
+            select(func.count())
+            .select_from(ArchivedTask)
+            .where(ArchivedTask.project_id == project_id)
+        )
         return {
             "project": memory.project_dict(project),
-            "accepted": plan_dict(head),
+            "accepted": accepted,
             "draft": plan_dict(draft),
-            "progress": flags,
-            "diff": plan_diff(head.proposal if head else None, draft.proposal) if draft else [],
-            "draft_stale": bool(draft and not proposal_is_current(draft, project, events)),
-            "current_validation": current_validation,
-            "plans": [plan_dict(row) for row in rows],
-            "events": [
-                {
-                    "id": e.id,
-                    "kind": e.kind,
-                    "payload": e.payload,
-                    "revision": e.revision,
-                    "created_at": iso_utc(e.created_at),
+            "progress": {
+                tid: {
+                    k: v
+                    for k, v in value.items()
+                    if k in {"done", "pinned", "spent_minutes", "archived"}
                 }
-                for e in events
-            ],
-            "context_usage": memory.metrics(messages),
+                for tid, value in flags.items()
+            },
+            "diff": plan_diff(accepted["proposal"] if accepted else None, draft.proposal)
+            if draft
+            else [],
+            "draft_stale": bool(draft and not await proposal_current(session, draft, project)),
+            "current_validation": validation,
+            "archive_count": archive_count,
+            "context_usage": await memory.context_metrics(session, project),
             "server_now": datetime.now(timezone.utc).isoformat(),
         }
 
 
 @serialized_model_operation
 async def propose(project_id: str, body: ProposePlan, client: YandexClient):
+    await register(project_id, body.request_id, "plan_propose", {"text": body.text})
     async with database._get_session_maker()() as session:
         project = await memory.require_project(session, project_id)
         existing = await session.scalar(
@@ -225,11 +279,14 @@ async def propose(project_id: str, body: ProposePlan, client: YandexClient):
             .order_by(PlanVersion.created_at.desc())
             .limit(1)
         )
-        flags = await progress_map(session, project_id)
         state = project.state
-        baseline = head.proposal if head else None
+        baseline = plan_dict(head)["proposal"] if head else None
+        flags = await progress_map(
+            session, project_id, task_ids(baseline, latest.proposal if latest else None)
+        )
+        requirement_snapshot = project.requirements
         # A disputed draft is retained as input even before the first acceptance.
-        reference = latest.proposal if latest else baseline
+        reference = plan_dict(latest)["proposal"] if latest else baseline
         events = (
             await session.scalars(
                 select(ProjectEvent)
@@ -241,22 +298,29 @@ async def propose(project_id: str, body: ProposePlan, client: YandexClient):
         evidence = {
             "accepted_plan": baseline,
             "latest_proposal": reference,
-            "progress": flags,
+            "progress": {key: value for key, value in flags.items() if not value.get("archived")},
+            "new_task_id_prefix": "t_" + str(body.request_id).split("-")[0] + "_",
             "events": [{"kind": e.kind, "payload": e.payload} for e in events],
             "now": datetime.now(timezone.utc).isoformat(),
             "numbered_constraints": [
-                {"ref": index, "text": text}
-                for index, text in enumerate(state.get("constraints", []), 1)
+                {"ref": index, **item} for index, item in enumerate(requirement_snapshot, 1)
             ],
         }
     instruction = """Подготовь предложение плана. Ответ — только JSON по схеме ниже.
 Дай 4–8 компактных задач, если это возможно. Оценки длительности — явно указанные предположения.
-Сохраняй id существующих задач. Все задачи принятого плана должны остаться в ответе;
+Сохраняй id существующих задач. Для новых id используй new_task_id_prefix и короткий суффикс.
+Завершённые и ранее отложенные незакреплённые задачи можно явно перечислить в archive_task_ids,
+чтобы убрать из текущих tasks и освободить лимит 30.
+Активную или закреплённую задачу архивировать нельзя.
+Архив не удаляет историю; пользователь отдельно принимает такое предложение.
+Остальные задачи принятого плана должны остаться в ответе;
 исключение показывай decision=defer с reason и tradeoff. Для закреплённых и выполненных
 сохрани title, done_when и decision=keep. Не меняй подтверждённые факты проекта.
 Для активных задач укажи зависимости; не ссылайся на отложенные. Весь оставшийся объём
 с buffer_minutes должен помещаться в available_minutes и доступные интервалы до дедлайна.
-constraint_refs — номера подтверждённых constraints, начиная с 1. Каждое требование
+requirement_refs — ссылки {id, version} из numbered_constraints. Для выполненных задач
+сохрани исходные ссылки: новая версия требования требует новой незавершённой работы.
+constraint_refs — прежние позиционные ссылки для совместимости. Каждое требование
 должно быть отражено хотя бы в одной неотложенной задаче. Сокращения объясняй:
 почему, что выигрываем и что теряем. Резерв по возможности сохраняй. Если обязательный
 объём не помещается, объясни конфликт в questions, не скрывай его уменьшением оценок.
@@ -270,8 +334,13 @@ constraint_refs — номера подтверждённых constraints, на�
         },
         {"role": "user", "text": body.text},
     ]
+
+    async def checker(value):
+        async with database._get_session_maker()() as session:
+            return await checked(session, project, value, baseline)
+
     proposal, validation, usage = await generate_checked(
-        client, messages, state, flags, baseline, guard
+        client, messages, state, flags, baseline, guard, checker, requirement_snapshot
     )
     validation["unchanged"] = bool(
         validation["valid"] and same_plan(baseline, proposal.model_dump())
@@ -291,6 +360,17 @@ constraint_refs — номера подтверждённых constraints, на�
             request_id=str(body.request_id),
             base_revision=body.base_revision,
             proposal=proposal.model_dump(),
+            requirements=list(
+                {
+                    key(item): item
+                    for item in [*(head.requirements if head else []), *requirement_snapshot]
+                    if key(item)
+                    in (
+                        {key(ref) for task in proposal.tasks for ref in task.requirement_refs}
+                        | {key(item) for item in requirement_snapshot}
+                    )
+                }.values()
+            ),
             validation=validation,
         )
         session.add(row)
@@ -322,6 +402,7 @@ constraint_refs — номера подтверждённых constraints, на�
 
 
 async def accept(project_id, plan_id, body):
+    await register(project_id, body.request_id, "plan_accept", {"plan_id": plan_id})
     async with database._get_session_maker()() as session:
         project = await memory.require_project(session, project_id)
         row = await session.get(PlanVersion, plan_id)
@@ -343,32 +424,46 @@ async def accept(project_id, plan_id, body):
                 return {"plan": plan_dict(row), "revision": project.revision, "replayed": True}
             raise memory.MemoryError("Эта версия уже была принята")
         memory.check_revision(project, body.base_revision)
-        events = (
-            await session.scalars(
-                select(ProjectEvent).where(
-                    ProjectEvent.project_id == project_id,
-                    ProjectEvent.revision > row.base_revision + 1,
-                )
-            )
-        ).all()
-        if not proposal_is_current(row, project, events):
+        if not await proposal_current(session, row, project):
             raise memory.MemoryError("Обстоятельства изменились. Подготовьте новый план")
-        flags = await progress_map(session, project_id)
         head = await head_plan(session, project_id)
-        validation = validate_plan(
+        validation = await checked(
+            session,
+            project,
             PlanProposal.model_validate(row.proposal),
-            project.state,
-            flags,
-            head.proposal if head else None,
+            plan_dict(head)["proposal"] if head else None,
         )
         if not validation["valid"]:
             raise memory.MemoryError(
                 "План не прошёл проверку: " + "; ".join(e["message"] for e in validation["errors"]),
                 422,
             )
-        if head and same_plan(head.proposal, row.proposal):
+        if head and same_plan(plan_dict(head)["proposal"], row.proposal):
             raise memory.MemoryError("План не изменился; повторное принятие не требуется")
         await memory.advance(session, project_id, body.base_revision)
+        old_tasks = {task["id"]: task for task in (head.proposal if head else {}).get("tasks", [])}
+        for task_id in row.proposal.get("archive_task_ids", []):
+            session.add(
+                ArchivedTask(
+                    project_id=project_id,
+                    task_id=task_id,
+                    task=old_tasks[task_id],
+                    constraints=[
+                        item["text"]
+                        for item in head.requirements
+                        if key(item)
+                        in {key(ref) for ref in old_tasks[task_id].get("requirement_refs", [])}
+                    ],
+                    requirements=[
+                        item
+                        for item in head.requirements
+                        if key(item)
+                        in {key(ref) for ref in old_tasks[task_id].get("requirement_refs", [])}
+                    ],
+                    source_plan_id=head.id,
+                )
+            )
+        await replace_dependencies(session, project_id, row.proposal)
         row.accepted_revision = body.base_revision + 1
         row.accept_request_id = str(body.request_id)
         session.add(
@@ -377,7 +472,10 @@ async def accept(project_id, plan_id, body):
                 request_id=str(body.request_id),
                 kind="plan_accepted",
                 revision=body.base_revision + 1,
-                payload={"plan_id": row.id},
+                payload={
+                    "plan_id": row.id,
+                    "archived_task_ids": row.proposal.get("archive_task_ids", []),
+                },
             )
         )
         await session.commit()
@@ -385,6 +483,7 @@ async def accept(project_id, plan_id, body):
 
 
 async def lose_time(project_id, body: LoseTime):
+    await register(project_id, body.request_id, "time_loss", {"minutes": body.minutes})
     async with database._get_session_maker()() as session:
         project = await memory.require_project(session, project_id)
         old = await session.scalar(
@@ -400,11 +499,9 @@ async def lose_time(project_id, body: LoseTime):
         memory.check_revision(project, body.base_revision)
         if project.state.get("available_minutes") is None:
             raise memory.MemoryError("Сначала укажите доступное время", 422)
-        state = {
-            **project.state,
-            "available_minutes": max(0, project.state["available_minutes"] - body.minutes),
-        }
-        await memory.advance(session, project_id, body.base_revision, state=state)
+        budget_values = change_budget(project, lost_delta=body.minutes)
+        state = budget_values["state"]
+        await memory.advance(session, project_id, body.base_revision, **budget_values)
         session.add(
             ProjectEvent(
                 project_id=project_id,
@@ -419,6 +516,8 @@ async def lose_time(project_id, body: LoseTime):
 
 
 async def change_task(project_id, task_id, body: ChangeTask):
+    payload = {"task_id": task_id, **body.model_dump(exclude={"request_id", "base_revision"})}
+    await register(project_id, body.request_id, "task_change", payload)
     async with database._get_session_maker()() as session:
         project = await memory.require_project(session, project_id)
         payload = {"task_id": task_id, **body.model_dump(exclude={"request_id", "base_revision"})}
@@ -439,42 +538,57 @@ async def change_task(project_id, task_id, body: ChangeTask):
         )
         if task is None or task["decision"] == "defer":
             raise memory.MemoryError("Активная задача принятого плана не найдена", 404)
-        flags = await progress_map(session, project_id)
         progress = await session.get(TaskProgress, (project_id, task_id))
         if progress is None:
             progress = TaskProgress(
                 project_id=project_id, task_id=task_id, done=False, pinned=False, spent_minutes=0
             )
-            session.add(progress)
-        state = dict(project.state)
+        spent_delta = 0
         if body.done is True and not progress.done:
-            if any(not flags.get(dep, {}).get("done") for dep in task["depends_on"]):
+            if await unfinished_ancestors(session, project_id, task_id):
                 raise memory.MemoryError("Сначала завершите задачи, от которых зависит эта", 422)
             spent = (
                 body.actual_minutes if body.actual_minutes is not None else task["estimate_minutes"]
             )
+            await session.execute(
+                delete(RequirementProof).where(
+                    RequirementProof.project_id == project_id, RequirementProof.task_id == task_id
+                )
+            )
+            refs = {key(ref) for ref in task.get("requirement_refs", [])}
+            session.add_all(
+                [
+                    RequirementProof(
+                        project_id=project_id,
+                        task_id=task_id,
+                        requirement_id=item["id"],
+                        version=item["version"],
+                        text=item["text"],
+                    )
+                    for item in head.requirements
+                    if key(item) in refs
+                ]
+            )
             progress.spent_minutes = spent
             progress.done = True
             progress.debited_minutes = 0
-            if state.get("available_minutes") is not None:
-                progress.debited_minutes = min(state["available_minutes"], spent)
-                state["available_minutes"] -= progress.debited_minutes
+            if project.time_budget_minutes is not None:
+                progress.debited_minutes = spent
+                spent_delta = spent
         elif body.done is False and progress.done:
-            if any(
-                flags.get(t["id"], {}).get("done") and task_id in t["depends_on"]
-                for t in head.proposal["tasks"]
-            ):
+            if await completed_dependents(session, project_id, task_id):
                 raise memory.MemoryError("Сначала верните в работу зависимые задачи", 422)
-            if state.get("available_minutes") is not None:
-                state["available_minutes"] += (
-                    progress.debited_minutes
-                    if progress.debited_minutes is not None
-                    else progress.spent_minutes
-                )
+            spent_delta = -(progress.debited_minutes or 0)
             progress.done, progress.spent_minutes, progress.debited_minutes = False, 0, 0
         if body.pinned is not None:
             progress.pinned = body.pinned
-        await memory.advance(session, project_id, body.base_revision, state=state)
+        await memory.advance(
+            session,
+            project_id,
+            body.base_revision,
+            **change_budget(project, spent_delta=spent_delta),
+        )
+        session.add(progress)
         session.add(
             ProjectEvent(
                 project_id=project_id,
@@ -486,3 +600,33 @@ async def change_task(project_id, task_id, body: ChangeTask):
         )
         await session.commit()
         return {"revision": body.base_revision + 1, "replayed": False}
+
+
+async def task_archive(project_id, offset=0, limit=30):
+    async with database._get_session_maker()() as session:
+        await memory.require_project(session, project_id)
+        total = await session.scalar(
+            select(func.count())
+            .select_from(ArchivedTask)
+            .where(ArchivedTask.project_id == project_id)
+        )
+        rows = (
+            await session.scalars(
+                select(ArchivedTask)
+                .where(ArchivedTask.project_id == project_id)
+                .order_by(ArchivedTask.archived_at.desc(), ArchivedTask.task_id)
+                .offset(offset)
+                .limit(limit)
+            )
+        ).all()
+        return {
+            "total": total,
+            "items": [
+                {
+                    "task": row.task,
+                    "source_plan_id": row.source_plan_id,
+                    "archived_at": iso_utc(row.archived_at),
+                }
+                for row in rows
+            ],
+        }
